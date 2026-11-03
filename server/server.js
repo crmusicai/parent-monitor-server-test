@@ -56,10 +56,16 @@ const PRESENCE_GRACE_MS = parseInt(process.env.PRESENCE_GRACE_MS || '30000', 10)
 // terminated, which runs the normal close path (sessions end,
 // presence grace starts).
 const WS_PING_MS = parseInt(process.env.WS_PING_MS || '30000', 10);
+// Feature datasets (v2.8 test track): the child app uploads snapshots of
+// its contacts / SIM call log / SMS (caps mirror the collectors); the
+// owning parent reads them back. Stored per child id under
+// data.datasets[childId] = { contacts|calls|sms: { items, syncedAt } }.
+const DATASET_CAPS = { contacts: 2000, calls: 500, sms: 1000 };
+const DATASET_BODY_MAX = 8 * 1024 * 1024;   // per-upload JSON byte cap (-> 400)
 
 // ---------------------------------------------------------------- storage
 function blankData() {
-  return { parents: [], tokens: {}, pairingCodes: {}, children: [], invites: {}, chats: {}, media: {} };
+  return { parents: [], tokens: {}, pairingCodes: {}, children: [], invites: {}, chats: {}, media: {}, datasets: {} };
 }
 function loadData() {
   try {
@@ -73,6 +79,7 @@ function loadData() {
       invites: d.invites && typeof d.invites === 'object' ? d.invites : {},
       chats: d.chats && typeof d.chats === 'object' ? d.chats : {},
       media: d.media && typeof d.media === 'object' ? d.media : {},
+      datasets: d.datasets && typeof d.datasets === 'object' ? d.datasets : {},
     };
   } catch { return blankData(); }
 }
@@ -120,6 +127,20 @@ function maybeWakeChild(child) {
     wakeAttempts++;
     wakeService.wake(child.id, child.fcmToken).catch(() => {});
   } catch {}
+}
+
+// Feature datasets: a parent's refresh asks the child to re-collect and
+// re-upload the named datasets. Delivered live over the child's socket
+// when one is up (returns true); otherwise a wake push nudges the app,
+// which also re-syncs on its next open / heartbeat (returns false).
+function relaySyncRequest(child, kinds) {
+  const cws = liveChildren.get(child.id);
+  if (cws && cws.readyState === 1) {
+    sendWs(cws, { type: 'sync_request', kinds: kinds && kinds.length ? kinds : ['contacts', 'calls', 'sms'] });
+    return true;
+  }
+  maybeWakeChild(child);
+  return false;
 }
 
 // The start-failure response for a held (or unholdable) start request:
@@ -207,6 +228,49 @@ function readBody(req) {
     });
     req.on('error', reject);
   });
+}
+// JSON body reader with a byte cap (feature-dataset uploads are larger
+// than the 1 MB general cap). Resolves null on oversize / parse error /
+// stream error — callers answer 400. Never throws, never hangs.
+function readBodyLimited(req, cap) {
+  return new Promise((resolve) => {
+    let body = '', tooLarge = false;
+    req.on('data', d => {
+      if (tooLarge) return;
+      body += d;
+      if (body.length > cap) { tooLarge = true; body = ''; }
+    });
+    req.on('end', () => {
+      if (tooLarge) return resolve(null);
+      if (!body) return resolve({});
+      try { resolve(JSON.parse(body)); } catch { resolve(null); }
+    });
+    req.on('error', () => resolve(null));
+  });
+}
+function isBoundedStr(v, max) { return typeof v === 'string' && v.length <= max; }
+function isFiniteNum(v) { return typeof v === 'number' && Number.isFinite(v); }
+// Shape check for one dataset item. Items that pass are stored VERBATIM
+// (no field is rebuilt), so a parent reads back exactly what the child
+// uploaded. Unknown extra fields are tolerated; wrong types are not.
+function validDatasetItem(kind, it) {
+  if (!it || typeof it !== 'object' || Array.isArray(it)) return false;
+  if (kind === 'contacts') {
+    return isBoundedStr(it.name, 200) && isBoundedStr(it.number, 64);
+  }
+  if (kind === 'calls') {
+    return isBoundedStr(it.number, 64) &&
+      (it.name === undefined || isBoundedStr(it.name, 200)) &&
+      Number.isInteger(it.type) && it.type >= 1 && it.type <= 7 &&
+      isFiniteNum(it.duration) && it.duration >= 0 &&
+      isFiniteNum(it.ts) && it.ts > 0 &&
+      (it.sim === undefined || isBoundedStr(it.sim, 32));
+  }
+  // sms
+  return isBoundedStr(it.address, 128) && isBoundedStr(it.body, 5000) &&
+    isFiniteNum(it.ts) && it.ts > 0 &&
+    Number.isInteger(it.type) && it.type >= 1 && it.type <= 6 &&
+    (it.read === undefined || it.read === 0 || it.read === 1 || typeof it.read === 'boolean');
 }
 // Raw-body reader for media uploads: drains the request fully even when it
 // exceeds the cap (so the client gets a clean 413 instead of a hang).
@@ -554,6 +618,13 @@ const server = http.createServer(async (req, res) => {
         pushStates: data.children.reduce((acc, c) => { acc[pushStateOf(c)]++; return acc; }, { ok: 0, fail: 0, none: 0 }),
         wakeAttempts,
         wakePending: wakePendings.size,
+        // Feature datasets: per-child item counts + last-sync stamps
+        // (counts and timestamps only; dataset content never appears).
+        datasets: Object.fromEntries(data.children.map(c => {
+          const rec = data.datasets[c.id] || {};
+          const one = k => rec[k] ? { count: rec[k].items.length, syncedAt: rec[k].syncedAt } : { count: 0, syncedAt: null };
+          return [c.id, { contacts: one('contacts'), calls: one('calls'), sms: one('sms') }];
+        })),
       });
     }
 
@@ -819,6 +890,31 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       return json(res, 200, { ok: true });
     }
 
+    // ---- feature dataset upload (child auth): one kind per call,
+    //      {kind: 'contacts'|'calls'|'sms', items: [...]}. Validation is
+    //      strict (kind, array, per-kind cap, per-item shape); anything
+    //      off is a 400 and nothing is stored. Items are stored verbatim.
+    if (p === '/api/children/data' && req.method === 'POST') {
+      const child = authChild(req);
+      if (!child) return json(res, 401, { error: 'unauthorized' });
+      const body = await readBodyLimited(req, DATASET_BODY_MAX);
+      if (!body) return json(res, 400, { error: 'bad or oversized body' });
+      const kind = String(body.kind || '');
+      if (!DATASET_CAPS[kind]) return json(res, 400, { error: 'bad kind' });
+      const items = body.items;
+      if (!Array.isArray(items)) return json(res, 400, { error: 'items must be an array' });
+      if (items.length > DATASET_CAPS[kind]) return json(res, 400, { error: 'too many items' });
+      for (const it of items) {
+        if (!validDatasetItem(kind, it)) return json(res, 400, { error: 'invalid item' });
+      }
+      const rec = (data.datasets[child.id] = data.datasets[child.id] || {});
+      const syncedAt = new Date().toISOString();
+      rec[kind] = { items, syncedAt };
+      child.lastSeen = new Date().toISOString();
+      save();
+      return json(res, 200, { ok: true, kind, count: items.length, syncedAt });
+    }
+
     // ---- chat history (SPEC-V2 §2): parent by childId, child for its own pair.
     //      v2.3: messages deleted-for the requester are excluded.
     if (p === '/api/chat' && req.method === 'GET') {
@@ -969,6 +1065,39 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       return res.end(bytes);
     }
 
+    // ---- feature dataset reads (parent, strictly owner-only: a child
+    //      that is missing OR belongs to another parent is the same 404).
+    //      ?refresh=1 first relays a sync_request to the child (live over
+    //      its socket, else a wake push) and still answers with the data
+    //      currently stored; the parent re-fetches to see fresh data.
+    const datasetMatch = p.match(/^\/api\/children\/([^/]+)\/(contacts|call-log|sms)$/);
+    if (datasetMatch && req.method === 'GET') {
+      const parent = authParent(req);
+      if (!parent) return json(res, 401, { error: 'unauthorized' });
+      const child = findOwnChild(parent, decodeURIComponent(datasetMatch[1]));
+      if (!child) return json(res, 404, { error: 'child not found' });
+      const kind = datasetMatch[2] === 'call-log' ? 'calls' : datasetMatch[2];
+      if (url.searchParams.get('refresh') === '1') relaySyncRequest(child, [kind]);
+      const rec = (data.datasets[child.id] || {})[kind];
+      return json(res, 200, {
+        kind,
+        syncedAt: rec ? rec.syncedAt : null,
+        count: rec ? rec.items.length : 0,
+        items: rec ? rec.items : [],
+      });
+    }
+    // ---- feature sync request (parent): relay a re-collect request for
+    //      every dataset kind to one of the parent's own children.
+    const syncMatch = p.match(/^\/api\/children\/([^/]+)\/sync$/);
+    if (syncMatch && req.method === 'POST') {
+      const parent = authParent(req);
+      if (!parent) return json(res, 401, { error: 'unauthorized' });
+      const child = findOwnChild(parent, decodeURIComponent(syncMatch[1]));
+      if (!child) return json(res, 404, { error: 'child not found' });
+      const delivered = relaySyncRequest(child, ['contacts', 'calls', 'sms']);
+      return json(res, 200, { ok: true, delivered });
+    }
+
     // ---- children (parent, strictly owner-filtered)
     if (p === '/api/children' && req.method === 'GET') {
       const parent = authParent(req);
@@ -1009,6 +1138,7 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
         const cws = liveChildren.get(child.id);
         if (cws) { try { cws.close(); } catch {} liveChildren.delete(child.id); }
         data.children = data.children.filter(c => c.id !== child.id);
+        delete data.datasets[child.id]; // feature datasets die with the child
         save();
         return json(res, 200, { ok: true });
       }

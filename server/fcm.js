@@ -20,6 +20,39 @@ const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const TOKEN_EXPIRY_S = 3600;         // JWT lifetime requested (1 h, the max)
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000; // refresh 5 min before expiry
 
+// Wake payload policy (step-3): every wake carries its reason in the
+// data payload so the woken app can tell a call (seconds matter) from
+// a chat nudge, a per-reason collapse_key so a newer wake replaces a
+// stale queued one instead of bursting, and a bounded TTL so wakes do
+// not pile up for days on an offline device. A call wake only needs to
+// outlive the ring window; a chat wake may reasonably wait an hour.
+const WAKE_TTL_BY_REASON = { call: '45s', listen: '120s', camera: '120s', chat: '3600s' };
+const WAKE_TTL_DEFAULT = '300s';
+// FCM error codes that mean the registration token itself is dead
+// (app uninstalled, token rotated away, token malformed): the caller
+// prunes the stored token when one of these comes back.
+const DEAD_TOKEN_CODES = new Set(['UNREGISTERED', 'INVALID_ARGUMENT']);
+
+/**
+ * Extract the FCM error code from an HTTP v1 error body:
+ * { error: { status, details: [ { '@type': '.../FcmError',
+ * errorCode: 'UNREGISTERED' } ] } }. The FcmError detail wins; the
+ * top-level status is the fallback. Null when nothing parses.
+ */
+function parseFcmErrorCode(body) {
+  try {
+    const err = body && body.error;
+    if (!err || typeof err !== 'object') return null;
+    if (Array.isArray(err.details)) {
+      for (const d of err.details) {
+        if (d && typeof d.errorCode === 'string' && d.errorCode) return d.errorCode;
+      }
+    }
+    if (typeof err.status === 'string' && err.status) return err.status;
+    return null;
+  } catch { return null; }
+}
+
 function base64url(input) {
   const buf = Buffer.isBuffer(input) ? input : Buffer.from(String(input), 'utf8');
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -84,16 +117,30 @@ function createSender(opts = {}) {
   }
 
   /**
-   * Send the wake push to one device token. High-priority, data-only
-   * (no notification payload — the app decides what to do, silently).
-   * @returns {Promise<boolean>} true only on an FCM 2xx.
+   * Detailed wake send. `payload` may carry { reason } (listen /
+   * camera / call / chat): the reason rides in the data payload, and
+   * the android block gains a per-reason collapse_key and TTL. With
+   * no payload the message is byte-identical to the original shape
+   * (data {wake:'1'}, android {priority:'high'}).
+   * @returns {Promise<{ok:boolean, status:number|null,
+   *   errorCode:string|null, dead:boolean}>} never throws. `dead`
+   *   means FCM rejected the token itself (UNREGISTERED /
+   *   INVALID_ARGUMENT) — the stored token should be pruned.
    */
-  async function sendWake(fcmToken) {
+  async function sendWakeDetailed(fcmToken, payload) {
     try {
-      if (!validServiceAccount(sa) || !fetchImpl) return false;
-      if (typeof fcmToken !== 'string' || !fcmToken) return false;
+      if (!validServiceAccount(sa) || !fetchImpl) return { ok: false, status: null, errorCode: 'unconfigured', dead: false };
+      if (typeof fcmToken !== 'string' || !fcmToken) return { ok: false, status: null, errorCode: 'no_token', dead: false };
       const accessToken = await getAccessToken();
-      if (!accessToken) return false;
+      if (!accessToken) return { ok: false, status: null, errorCode: 'oauth_failed', dead: false };
+      const reason = payload && typeof payload.reason === 'string' && payload.reason ? payload.reason : null;
+      const data = { wake: '1' };
+      const android = { priority: 'high' };
+      if (reason) {
+        data.reason = reason;
+        android.collapse_key = 'fc_wake_' + reason;
+        android.ttl = WAKE_TTL_BY_REASON[reason] || WAKE_TTL_DEFAULT;
+      }
       const url = `https://fcm.googleapis.com/v1/projects/${sa.project_id}/messages:send`;
       const res = await fetchImpl(url, {
         method: 'POST',
@@ -104,18 +151,38 @@ function createSender(opts = {}) {
         body: JSON.stringify({
           message: {
             token: fcmToken,
-            data: { wake: '1' },
-            android: { priority: 'high' },
+            data,
+            android,
           },
         }),
       });
-      return !!(res && res.ok);
+      if (res && res.ok) return { ok: true, status: res.status || 200, errorCode: null, dead: false };
+      let errorCode = null;
+      if (res && typeof res.json === 'function') {
+        errorCode = parseFcmErrorCode(await res.json().catch(() => null));
+      }
+      return {
+        ok: false,
+        status: res && typeof res.status === 'number' ? res.status : null,
+        errorCode,
+        dead: !!errorCode && DEAD_TOKEN_CODES.has(errorCode),
+      };
     } catch {
-      return false;
+      return { ok: false, status: null, errorCode: 'send_exception', dead: false };
     }
   }
 
-  return { sendWake, _getAccessToken: getAccessToken };
+  /**
+   * Send the wake push to one device token. High-priority, data-only
+   * (no notification payload — the app decides what to do, silently).
+   * @returns {Promise<boolean>} true only on an FCM 2xx.
+   */
+  async function sendWake(fcmToken, payload) {
+    const r = await sendWakeDetailed(fcmToken, payload);
+    return r.ok;
+  }
+
+  return { sendWake, sendWakeDetailed, _getAccessToken: getAccessToken };
 }
 
 /**
@@ -123,23 +190,43 @@ function createSender(opts = {}) {
  * windowMs (default 20 s), in memory. The attempt timestamp is stamped
  * before sending, so a failing network cannot cause a retry storm.
  * `sender` may be a sendWake function or an object with .sendWake.
+ *
+ * wake() keeps the original boolean contract (true only when a send
+ * was attempted and FCM accepted it). wakeDetailed() returns the full
+ * outcome { sent, throttled, ok, status, errorCode, dead } so callers
+ * can log attempts and prune dead tokens.
  */
 function createWakeService(sender, opts = {}) {
+  const detailedFn = sender && typeof sender.sendWakeDetailed === 'function'
+    ? sender.sendWakeDetailed.bind(sender) : null;
   const sendFn = typeof sender === 'function'
     ? sender
     : (sender && typeof sender.sendWake === 'function' ? sender.sendWake.bind(sender) : null);
   const windowMs = typeof opts.windowMs === 'number' ? opts.windowMs : 20000;
   const nowFn = opts.nowFn || (() => Date.now());
   const lastAttempt = new Map(); // key -> ms
+  async function wakeDetailed(key, fcmToken, payload) {
+    const base = { sent: false, throttled: false, ok: false, status: null, errorCode: null, dead: false };
+    if ((!detailedFn && !sendFn) || typeof fcmToken !== 'string' || !fcmToken) return base;
+    const now = nowFn();
+    const prev = lastAttempt.get(key);
+    if (prev != null && now - prev < windowMs) return { ...base, throttled: true };
+    lastAttempt.set(key, now);
+    try {
+      if (detailedFn) {
+        const r = await detailedFn(fcmToken, payload);
+        return { sent: true, throttled: false, ok: !!r.ok, status: r.status ?? null, errorCode: r.errorCode ?? null, dead: !!r.dead };
+      }
+      const ok = await sendFn(fcmToken, payload);
+      return { ...base, sent: true, ok: !!ok };
+    } catch { return { ...base, sent: true, errorCode: 'send_exception' }; }
+  }
   return {
-    async wake(key, fcmToken) {
-      if (!sendFn || typeof fcmToken !== 'string' || !fcmToken) return false;
-      const now = nowFn();
-      const prev = lastAttempt.get(key);
-      if (prev != null && now - prev < windowMs) return false;
-      lastAttempt.set(key, now);
-      try { return await sendFn(fcmToken); } catch { return false; }
+    async wake(key, fcmToken, payload) {
+      const r = await wakeDetailed(key, fcmToken, payload);
+      return r.sent && r.ok;
     },
+    wakeDetailed,
     _lastAttempt: lastAttempt,
   };
 }
@@ -161,14 +248,16 @@ function defaultSender() {
   return _defaultSender;
 }
 /** Default entry point used by server.js. Safe no-op when unconfigured. */
-async function sendWake(fcmToken) {
-  return defaultSender().sendWake(fcmToken);
+async function sendWake(fcmToken, payload) {
+  return defaultSender().sendWake(fcmToken, payload);
 }
 
 module.exports = {
   buildJwt,
   base64url,
   validServiceAccount,
+  parseFcmErrorCode,
+  WAKE_TTL_BY_REASON,
   createSender,
   createWakeService,
   defaultSender,

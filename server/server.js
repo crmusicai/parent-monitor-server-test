@@ -32,10 +32,10 @@ const MEDIA_MAX_BYTES = 10 * 1024 * 1024;        // media upload cap (413 above)
 const MEDIA_MAX_FILES = 200;                     // stored media files kept (oldest pruned)
 // Ring timeout for unaccepted calls (45 s per SPEC-V2; env override exists for tests).
 const RING_TIMEOUT_MS = parseInt(process.env.RING_TIMEOUT_MS || '45000', 10);
-// Wake-and-wait window: how long a parent-initiated listen/camera/call
-// request for an offline child is HELD while an FCM wake push tries to
-// bring the child's socket back, before the request fails with the
-// usual 'offline' error. Env override exists for tests.
+// Wake-and-wait window (step-3, ported from the test server): how long
+// a start request for an offline party is HELD while an FCM wake push
+// tries to bring that party's socket back, before the request fails
+// with the usual 'offline' error. Env override exists for tests.
 const WAKE_WAIT_MS = parseInt(process.env.WAKE_WAIT_MS || '50000', 10);
 const MEDIA_DIR = path.join(path.dirname(DATA_FILE), 'media');
 // Presence grace (v2.4 audit round; merged from server.proposed.js, NOT
@@ -56,16 +56,10 @@ const PRESENCE_GRACE_MS = parseInt(process.env.PRESENCE_GRACE_MS || '30000', 10)
 // terminated, which runs the normal close path (sessions end,
 // presence grace starts).
 const WS_PING_MS = parseInt(process.env.WS_PING_MS || '30000', 10);
-// Feature datasets (v2.8 test track): the child app uploads snapshots of
-// its contacts / SIM call log / SMS (caps mirror the collectors); the
-// owning parent reads them back. Stored per child id under
-// data.datasets[childId] = { contacts|calls|sms: { items, syncedAt } }.
-const DATASET_CAPS = { contacts: 2000, calls: 500, sms: 1000 };
-const DATASET_BODY_MAX = 8 * 1024 * 1024;   // per-upload JSON byte cap (-> 400)
 
 // ---------------------------------------------------------------- storage
 function blankData() {
-  return { parents: [], tokens: {}, pairingCodes: {}, children: [], invites: {}, chats: {}, media: {}, datasets: {} };
+  return { parents: [], tokens: {}, pairingCodes: {}, children: [], invites: {}, chats: {}, media: {}, numbers: {} };
 }
 function loadData() {
   try {
@@ -79,7 +73,10 @@ function loadData() {
       invites: d.invites && typeof d.invites === 'object' ? d.invites : {},
       chats: d.chats && typeof d.chats === 'object' ? d.chats : {},
       media: d.media && typeof d.media === 'object' ? d.media : {},
-      datasets: d.datasets && typeof d.datasets === 'object' ? d.datasets : {},
+      // Number accounts (number system): normalized phone number ->
+      // { childId, salt, passwordHash, deviceName, createdAt }. Older
+      // data files simply have no such key yet.
+      numbers: d.numbers && typeof d.numbers === 'object' ? d.numbers : {},
     };
   } catch { return blankData(); }
 }
@@ -98,49 +95,93 @@ const sessions = new Map();      // sessionId -> {id, parentId, childId, parentW
 const childDebug = new Map();    // childId -> [debug strings] (diagnostics, memory-only)
 const parentDebug = new Map();   // parentId -> [debug strings] (diagnostics, memory-only)
 const lastSessions = [];         // archived session summaries after close (diagnostics)
-const wakePendings = new Map();  // `${parentId}|${childId}|${kind}` -> held wake-and-wait request
+const wakePendings = new Map();  // `${parentId}|${childId}|${kind}` -> held parent->child wake-and-wait request
+const parentWakePendings = new Map();  // childId -> held child->parent call wake-and-wait request
+const wakeLog = [];              // bounded wake-attempt log (diagnostics, memory-only; never token values)
+const WAKE_LOG_CAP = 50;
 let wakeAttempts = 0;            // diagnostics: wake pushes handed to the wake service
 
 // ---------------------------------------------------------------- FCM wake
-// Wake-and-wait: when a parent-initiated listen/camera/call targets a
-// child with no live socket, the request is HELD as a wake pending
-// (wakePendings) instead of failing instantly, while a high-priority
-// FCM data push tries to wake the child's app so its reconnect logic
-// can bring the socket back. When the child socket registers,
-// flushWakePendings() re-validates each held request (parent socket
-// still open, pairing intact, neither party busy) and executes the
-// original start logic; a request whose child never appears fails with
-// the same offline error shape as before, after WAKE_WAIT_MS. The push
-// itself is fire-and-forget and throttled per child inside the wake
-// service. No-op when FCM is unconfigured or the child never registered
-// a token (the request still waits — the wake is best-effort). Token
-// values are never logged.
+// Wake-and-wait (step-3; the pend/flush machinery is ported from the
+// test server, where it was proven in the 2.7/2.8 line): when a start
+// request targets a party with no live socket, the request is HELD as
+// a wake pending instead of failing instantly, while a high-priority
+// FCM data push tries to wake that party's app so its reconnect logic
+// can bring the socket back. When the socket registers, the flush
+// re-validates each held request (requester socket still open, pairing
+// intact, neither party busy) and executes the original start logic; a
+// request whose target never appears fails with the same offline error
+// shape as before, after WAKE_WAIT_MS. Chat wakes stay fire-and-
+// forget (the message is already stored). Every attempt is logged to
+// the bounded wakeLog (target id + reason + FCM result + wait outcome;
+// token values are NEVER logged), and an FCM answer that the token is
+// dead (UNREGISTERED / INVALID_ARGUMENT) prunes it from the store so
+// later actions do not keep pushing at a corpse. The push itself is
+// throttled per target inside the wake service. No-op when FCM is
+// unconfigured or the target never registered a token (a held request
+// still waits — the wake is best-effort).
 const wakeService = fcm.createWakeService(fcm.defaultSender(), { windowMs: 20000 });
 function childSocketOpen(childId) {
   const cws = liveChildren.get(childId);
   return !!cws && cws.readyState === 1;
 }
-function maybeWakeChild(child) {
+function parentSocketOpen(parentId) {
+  const set = liveParents.get(parentId);
+  return !!set && [...set].some(w => w.readyState === 1);
+}
+// Append one entry to the bounded wake log and return it; the FCM
+// result and the wait outcome are filled in as they resolve.
+function recordWake(role, targetId, reason, fcmState) {
+  const entry = { ts: new Date().toISOString(), role, target: targetId, reason, fcm: fcmState, errorCode: null, wait: null };
+  wakeLog.push(entry);
+  while (wakeLog.length > WAKE_LOG_CAP) wakeLog.shift();
+  return entry;
+}
+// FCM says the token itself is dead: clear it from the record (only if
+// it is still the exact token we sent to — a rotation may already have
+// replaced it) and persist.
+function pruneDeadToken(rec, tokenSent) {
+  try {
+    if (rec && rec.fcmToken && rec.fcmToken === tokenSent) {
+      rec.fcmToken = null;
+      save();
+    }
+  } catch {}
+}
+// Fire one wake push at a child/parent record. Always returns the log
+// entry (fcm: 'no_token' when there is nothing to send to); the entry's
+// fcm/errorCode fields are updated when the send resolves. Never throws.
+function attemptWake(role, rec, reason) {
+  if (!rec) return null;
+  if (!rec.fcmToken) return recordWake(role, rec.id, reason, 'no_token');
+  const entry = recordWake(role, rec.id, reason, 'sent');
+  wakeAttempts++;
+  const token = rec.fcmToken;
+  const key = role === 'parent' ? 'parent:' + rec.id : rec.id;
+  wakeService.wakeDetailed(key, token, { reason }).then(r => {
+    if (r.throttled) entry.fcm = 'throttled';
+    else if (r.dead) { entry.fcm = 'dead'; entry.errorCode = r.errorCode; pruneDeadToken(rec, token); }
+    else if (r.ok) entry.fcm = 'ok';
+    else { entry.fcm = 'error'; entry.errorCode = r.errorCode || (r.status ? 'http_' + r.status : null); }
+    console.log(`[wake] ${role} ${rec.id} reason=${reason} -> ${entry.fcm}${entry.errorCode ? ' (' + entry.errorCode + ')' : ''}`);
+  }).catch(() => { entry.fcm = 'error'; });
+  return entry;
+}
+function maybeWakeChild(child, reason) {
   try {
     if (!child || !child.fcmToken) return;
     if (childSocketOpen(child.id)) return;
-    wakeAttempts++;
-    wakeService.wake(child.id, child.fcmToken).catch(() => {});
+    const entry = attemptWake('child', child, reason || 'wake');
+    if (entry) entry.wait = 'not_waited';
   } catch {}
 }
-
-// Feature datasets: a parent's refresh asks the child to re-collect and
-// re-upload the named datasets. Delivered live over the child's socket
-// when one is up (returns true); otherwise a wake push nudges the app,
-// which also re-syncs on its next open / heartbeat (returns false).
-function relaySyncRequest(child, kinds) {
-  const cws = liveChildren.get(child.id);
-  if (cws && cws.readyState === 1) {
-    sendWs(cws, { type: 'sync_request', kinds: kinds && kinds.length ? kinds : ['contacts', 'calls', 'sms'] });
-    return true;
-  }
-  maybeWakeChild(child);
-  return false;
+function maybeWakeParent(parent, reason) {
+  try {
+    if (!parent || !parent.fcmToken) return;
+    if (parentSocketOpen(parent.id)) return;
+    const entry = attemptWake('parent', parent, reason || 'wake');
+    if (entry) entry.wait = 'not_waited';
+  } catch {}
 }
 
 // The start-failure response for a held (or unholdable) start request:
@@ -154,7 +195,10 @@ function sendStartFailure(parentWs, kind, childId, reason) {
 function pendingKey(parentId, childId, kind) { return `${parentId}|${childId}|${kind}`; }
 function dropWakePending(key) {
   const p = wakePendings.get(key);
-  if (p) { clearTimeout(p.timer); wakePendings.delete(key); }
+  if (p) {
+    clearTimeout(p.timer); wakePendings.delete(key);
+    if (p.logEntry && p.logEntry.wait === 'waiting') p.logEntry.wait = 'cancelled';
+  }
   return p || null;
 }
 // Hold a parent-initiated start request for an offline child. One
@@ -168,11 +212,14 @@ function pendWakeRequest(parentWs, child, kind, extra) {
     kind, parentWs, parentId: parentWs.parentId, childId: child.id,
     facing: extra && extra.facing ? extra.facing : undefined,
     media: extra && extra.media ? extra.media : undefined,
+    logEntry: extra && extra.logEntry ? extra.logEntry : null,
     createdAt: Date.now(), timer: null,
   };
+  if (p.logEntry) p.logEntry.wait = 'waiting';
   p.timer = setTimeout(() => {
     if (wakePendings.get(key) !== p) return; // replaced or flushed
     wakePendings.delete(key);
+    if (p.logEntry) p.logEntry.wait = 'timeout';
     sendStartFailure(p.parentWs, kind, p.childId, 'offline');
   }, WAKE_WAIT_MS);
   if (p.timer.unref) p.timer.unref();
@@ -190,6 +237,7 @@ function flushWakePendings(child) {
     if (p.childId !== child.id) continue;
     wakePendings.delete(key);
     clearTimeout(p.timer);
+    if (p.logEntry) p.logEntry.wait = 'connected';
     if (!p.parentWs || p.parentWs.readyState !== 1) continue;
     const fresh = data.children.find(c => c.id === p.childId);
     if (!fresh || fresh.parentId !== p.parentId) continue;
@@ -208,7 +256,59 @@ function flushWakePendings(child) {
 // Parent socket went away: its held requests die with it, silently.
 function clearWakePendingsForParentWs(ws) {
   for (const [key, p] of [...wakePendings.entries()]) {
-    if (p.parentWs === ws) { clearTimeout(p.timer); wakePendings.delete(key); }
+    if (p.parentWs === ws) dropWakePending(key);
+  }
+}
+// Hold a child-initiated call for an offline parent (the mirror image
+// of pendWakeRequest). One pending per child — a child can only be
+// placing one outgoing call. The child hears nothing while waiting;
+// when the parent registers, flushParentWakePendings() runs the
+// original call_start logic.
+function pendParentWake(childWs, child, media, logEntry) {
+  dropParentWakePending(child.id);
+  const p = {
+    childWs, parentId: child.parentId, childId: child.id, media,
+    logEntry: logEntry || null, createdAt: Date.now(), timer: null,
+  };
+  if (p.logEntry) p.logEntry.wait = 'waiting';
+  p.timer = setTimeout(() => {
+    if (parentWakePendings.get(child.id) !== p) return; // replaced or flushed
+    parentWakePendings.delete(child.id);
+    if (p.logEntry) p.logEntry.wait = 'timeout';
+    sendWs(p.childWs, { type: 'call_error', reason: 'offline' });
+  }, WAKE_WAIT_MS);
+  if (p.timer.unref) p.timer.unref();
+  parentWakePendings.set(child.id, p);
+}
+function dropParentWakePending(childId, outcome) {
+  const p = parentWakePendings.get(childId);
+  if (p) {
+    clearTimeout(p.timer); parentWakePendings.delete(childId);
+    if (p.logEntry && p.logEntry.wait === 'waiting') p.logEntry.wait = outcome || 'cancelled';
+  }
+  return p || null;
+}
+// Execute held child->parent calls for a parent whose socket just
+// registered: re-validate (child still connected, pairing intact),
+// then ring every live parent socket exactly like the immediate path.
+function flushParentWakePendings(parent) {
+  for (const [key, p] of [...parentWakePendings.entries()]) {
+    if (p.parentId !== parent.id) continue;
+    parentWakePendings.delete(key);
+    clearTimeout(p.timer);
+    if (p.logEntry) p.logEntry.wait = 'connected';
+    const cws = liveChildren.get(p.childId);
+    if (!cws || cws.readyState !== 1) continue;
+    const fresh = data.children.find(c => c.id === p.childId);
+    if (!fresh || fresh.parentId !== parent.id) continue;
+    if (partyBusy(parent.id, p.childId)) {
+      sendWs(cws, { type: 'call_busy', childId: p.childId });
+      continue;
+    }
+    const s = createSession({ kind: 'call', state: 'ringing', media: p.media, parentId: parent.id, childId: p.childId, parentWs: null, childWs: cws, initiatorRole: 'child' });
+    armRingTimer(s);
+    const set = liveParents.get(parent.id);
+    if (set) for (const pws of set) sendWs(pws, { type: 'call_invite', sessionId: s.id, media: p.media, fromId: p.childId });
   }
 }
 
@@ -228,49 +328,6 @@ function readBody(req) {
     });
     req.on('error', reject);
   });
-}
-// JSON body reader with a byte cap (feature-dataset uploads are larger
-// than the 1 MB general cap). Resolves null on oversize / parse error /
-// stream error — callers answer 400. Never throws, never hangs.
-function readBodyLimited(req, cap) {
-  return new Promise((resolve) => {
-    let body = '', tooLarge = false;
-    req.on('data', d => {
-      if (tooLarge) return;
-      body += d;
-      if (body.length > cap) { tooLarge = true; body = ''; }
-    });
-    req.on('end', () => {
-      if (tooLarge) return resolve(null);
-      if (!body) return resolve({});
-      try { resolve(JSON.parse(body)); } catch { resolve(null); }
-    });
-    req.on('error', () => resolve(null));
-  });
-}
-function isBoundedStr(v, max) { return typeof v === 'string' && v.length <= max; }
-function isFiniteNum(v) { return typeof v === 'number' && Number.isFinite(v); }
-// Shape check for one dataset item. Items that pass are stored VERBATIM
-// (no field is rebuilt), so a parent reads back exactly what the child
-// uploaded. Unknown extra fields are tolerated; wrong types are not.
-function validDatasetItem(kind, it) {
-  if (!it || typeof it !== 'object' || Array.isArray(it)) return false;
-  if (kind === 'contacts') {
-    return isBoundedStr(it.name, 200) && isBoundedStr(it.number, 64);
-  }
-  if (kind === 'calls') {
-    return isBoundedStr(it.number, 64) &&
-      (it.name === undefined || isBoundedStr(it.name, 200)) &&
-      Number.isInteger(it.type) && it.type >= 1 && it.type <= 7 &&
-      isFiniteNum(it.duration) && it.duration >= 0 &&
-      isFiniteNum(it.ts) && it.ts > 0 &&
-      (it.sim === undefined || isBoundedStr(it.sim, 32));
-  }
-  // sms
-  return isBoundedStr(it.address, 128) && isBoundedStr(it.body, 5000) &&
-    isFiniteNum(it.ts) && it.ts > 0 &&
-    Number.isInteger(it.type) && it.type >= 1 && it.type <= 6 &&
-    (it.read === undefined || it.read === 0 || it.read === 1 || typeof it.read === 'boolean');
 }
 // Raw-body reader for media uploads: drains the request fully even when it
 // exceeds the cap (so the client gets a clean 413 instead of a hang).
@@ -331,6 +388,9 @@ function childView(c) {
     id: c.id,
     name: c.name,
     model: c.model,
+    // Number account (number system): the address a parent used to add
+    // this device, or null for invite/code-paired devices.
+    number: c.number || null,
     push: pushStateOf(c),
     online: childOnline(c),
     lastSeen: c.lastSeen || null,
@@ -381,6 +441,11 @@ function createSession(fields) {
 // potential party (they all got the invite and any of them may accept).
 function peerSockets(session, excludeWs) {
   const out = new Set();
+  // Contact sessions (number system): the two parties are child sockets.
+  if (session.contact) {
+    if (session.aWs) out.add(session.aWs);
+    if (session.bWs) out.add(session.bWs);
+  }
   if (session.parentWs) out.add(session.parentWs);
   else if (session.kind === 'call') {
     const set = liveParents.get(session.parentId);
@@ -394,9 +459,67 @@ function peerSockets(session, excludeWs) {
 // (listen/camera/call) cannot join a new one.
 function partyBusy(parentId, childId) {
   for (const s of sessions.values()) {
-    if (s.parentId === parentId || s.childId === childId) return true;
+    if (s.parentId === parentId || s.childId === childId ||
+        s.aChildId === childId || s.bChildId === childId) return true;
   }
   return false;
+}
+// Is this socket one of the two parties of the session? Contact
+// sessions (number system) party on two CHILD sockets (aWs = caller,
+// bWs = callee); every other session parties on parentWs/childWs.
+function sessionParty(session, ws) {
+  if (session.contact) return ws === session.aWs || ws === session.bWs;
+  return ws === session.parentWs || ws === session.childWs;
+}
+// The OTHER party's socket (signalling relay target), or null.
+function sessionPeer(session, ws) {
+  if (session.contact) return ws === session.aWs ? session.bWs : (ws === session.bWs ? session.aWs : null);
+  return ws === session.parentWs ? session.childWs : session.parentWs;
+}
+// A child is busy when it parties ANY live session, in any role
+// (bound child in a parent session, or either side of a contact call).
+function childBusyAny(childId) {
+  for (const s of sessions.values()) {
+    if (s.childId === childId || s.aChildId === childId || s.bChildId === childId) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Number system (owner design 2026-11-04): a child can register an
+// account with its phone NUMBER + a self-set password instead of being
+// paired by invite/code. The number is only an ADDRESS: the account's
+// secret deviceToken stays the real credential (rotated on every
+// password login), a parent binds the device by entering the number,
+// and two number-registered children can be CONTACTS (call/chat only —
+// the control kinds stay gated to parent bindings; the listen/camera
+// handlers below refuse any non-parent socket outright). Invite-link
+// and code pairing are unchanged. Passwords are stored ONLY as scrypt
+// hashes (the same hashPassword/checkPassword helpers the parent
+// accounts use — Node built-in crypto, no new dependencies).
+// ---------------------------------------------------------------------------
+function normalizeNumber(raw) {
+  const s = String(raw == null ? '' : raw).replace(/[\s\-()]/g, '');
+  return /^\+?\d{6,15}$/.test(s) ? s : null;
+}
+function contactsOf(child) {
+  if (!Array.isArray(child.contacts)) child.contacts = [];
+  return child.contacts;
+}
+function areContacts(aId, bId) {
+  const a = data.children.find(c => c.id === aId);
+  return !!a && contactsOf(a).includes(bId);
+}
+// Chat store key for a contact pair (device-pair keyed, order-free).
+function contactKey(aId, bId) { return aId < bId ? `c:${aId}:${bId}` : `c:${bId}:${aId}`; }
+function contactView(c) {
+  return {
+    childId: c.id,
+    number: c.number || null,
+    name: c.name,
+    model: c.model || '',
+    online: childOnline(c),
+  };
 }
 // Session starters shared by the immediate (child connected) path and
 // the wake-and-wait flush, so both produce byte-identical messages.
@@ -448,11 +571,33 @@ function chatView(msg) {
     read: Array.isArray(msg.readBy) && msg.readBy.includes(recipientKey),
   };
 }
-function chatHistoryFor(parentId, childId, viewerKey) {
-  const arr = data.chats[chatKey(parentId, childId)] || [];
+// Wire shape of a CONTACT chat message (number system): the pair is
+// two children, so the parties are named by device id (fromId/toId)
+// instead of the parent/child pair fields. `read` is true once the
+// recipient (toId) has marked the pair read.
+function chatViewC(msg) {
+  return {
+    id: msg.id, contact: true, fromId: msg.fromId, toId: msg.toId,
+    fromRole: 'child', kind: msg.kind, body: msg.body, mediaId: msg.mediaId,
+    ts: msg.ts,
+    replyTo: msg.replyTo ?? null,
+    replySnippet: msg.replySnippet ?? null,
+    read: Array.isArray(msg.readBy) && msg.readBy.includes(msg.toId),
+  };
+}
+function chatHistoryByKey(key, viewerKey) {
+  const arr = data.chats[key] || [];
   return arr
     .filter(m => !(Array.isArray(m.deletedFor) && m.deletedFor.includes(viewerKey)))
-    .map(chatView);
+    .map(m => (m.contact ? chatViewC(m) : chatView(m)));
+}
+function chatHistoryFor(parentId, childId, viewerKey) {
+  return chatHistoryByKey(chatKey(parentId, childId), viewerKey);
+}
+// Push a chat event to both live sockets of a contact pair.
+function pushContactChatEvent(aId, bId, obj) {
+  sendWs(liveChildren.get(aId), obj);
+  sendWs(liveChildren.get(bId), obj);
 }
 // Push a chat event to every live socket of BOTH parties of a pair (parent
 // hub sockets + the child socket). Used for chat_delete: the other party
@@ -612,19 +757,23 @@ const server = http.createServer(async (req, res) => {
         childCrash: Object.fromEntries(
           data.children.filter(c => c.lastCrash).map(c => [c.id, c.lastCrash])
         ),
-        // Wake-and-wait diagnostics: per-state push reachability counts
-        // (same derivation as childView.push), wake pushes attempted,
-        // and requests currently held waiting for a child to appear.
+        // Wake diagnostics (step-3): per-state push reachability counts
+        // (same derivation as childView.push, plus the parent mirror),
+        // wake pushes attempted, requests currently held in wake-and-
+        // wait (both directions), and the bounded wake-attempt log
+        // (target, reason, FCM result, wait outcome — never tokens).
         pushStates: data.children.reduce((acc, c) => { acc[pushStateOf(c)]++; return acc; }, { ok: 0, fail: 0, none: 0 }),
+        parentPushStates: data.parents.reduce((acc, par) => { acc[par.fcmToken ? 'ok' : 'none']++; return acc; }, { ok: 0, none: 0 }),
         wakeAttempts,
-        wakePending: wakePendings.size,
-        // Feature datasets: per-child item counts + last-sync stamps
-        // (counts and timestamps only; dataset content never appears).
-        datasets: Object.fromEntries(data.children.map(c => {
-          const rec = data.datasets[c.id] || {};
-          const one = k => rec[k] ? { count: rec[k].items.length, syncedAt: rec[k].syncedAt } : { count: 0, syncedAt: null };
-          return [c.id, { contacts: one('contacts'), calls: one('calls'), sms: one('sms') }];
-        })),
+        wakePending: wakePendings.size + parentWakePendings.size,
+        wakeLog,
+        // Number system (additive): registered number accounts and
+        // contact pairs (each pair counted once — contacts are stored
+        // on both children, so the raw edge count is halved).
+        numberAccounts: Object.keys(data.numbers).length,
+        contactPairs: Math.floor(
+          data.children.reduce((n, c) => n + (Array.isArray(c.contacts) ? c.contacts.length : 0), 0) / 2
+        ),
       });
     }
 
@@ -648,9 +797,9 @@ const server = http.createServer(async (req, res) => {
       if (!valid) {
         res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Private Call</title></head>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Family Call</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px 20px">
-<h1>Private Call</h1>
+<h1>Family Call</h1>
 <p>This invite link is invalid or has expired.</p>
 <p>Please ask the person who sent it to create a new link.</p>
 </body></html>`);
@@ -660,9 +809,9 @@ const server = http.createServer(async (req, res) => {
       if (!injected) {
         res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Private Call</title></head>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Family Call</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px 20px">
-<h1>Private Call</h1>
+<h1>Family Call</h1>
 <p>The app file is not available on the server yet. Please try again later.</p>
 </body></html>`);
       }
@@ -683,19 +832,19 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       if (!valid) {
         return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Private Call</title></head>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Family Call</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px 20px">
-<h1>Private Call</h1>
+<h1>Family Call</h1>
 <p>This invite link is invalid or has expired.</p>
 <p>Please ask the person who sent it to create a new link.</p>
 </body></html>`);
       }
       const apkReady = fs.existsSync(path.join(__dirname, 'PrivateCall.apk'));
       return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Private Call</title></head>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Family Call</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px 20px">
-<h1>Private Call</h1>
-<p>You have been invited to install <b>Private Call</b>.</p>
+<h1>Family Call</h1>
+<p>You have been invited to install <b>Family Call</b>.</p>
 <p><a href="/d/${inv.token}" style="display:inline-block;background:#12805c;color:#fff;padding:16px 32px;border-radius:10px;text-decoration:none;font-size:20px">Download App</a></p>
 ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.</i></p>'}
 <p>After installing, just open the app — it connects by itself.</p>
@@ -704,7 +853,7 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
 
     // ---- parent auth
     if (p === '/api/parents/register' && req.method === 'POST') {
-      const { name, phone, password } = await readBody(req).catch(() => null) || {};
+      const { name, phone, password, fcmToken } = await readBody(req).catch(() => null) || {};
       if (!name || !phone || !password) return json(res, 400, { error: 'name, phone and password required' });
       if (String(password).length < 6) return json(res, 400, { error: 'password must be at least 6 characters' });
       if (data.parents.some(x => x.phone === String(phone))) return json(res, 409, { error: 'phone already registered' });
@@ -713,6 +862,10 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
         id: crypto.randomBytes(8).toString('hex'),
         name: String(name), phone: String(phone),
         salt, passwordHash: hashPassword(password, salt),
+        // Parent FCM token (step-3): lets the server wake an offline
+        // parent for child-initiated calls/chat. Optional everywhere;
+        // also accepted at login and over the parent WS. Never logged.
+        fcmToken: fcmToken ? String(fcmToken) : null,
         createdAt: new Date().toISOString(),
       };
       data.parents.push(parent);
@@ -722,9 +875,12 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       return json(res, 201, { parentId: parent.id, token });
     }
     if (p === '/api/parents/login' && req.method === 'POST') {
-      const { phone, password } = await readBody(req).catch(() => null) || {};
+      const { phone, password, fcmToken } = await readBody(req).catch(() => null) || {};
       const parent = data.parents.find(x => x.phone === String(phone || ''));
       if (!parent || !checkPassword(password || '', parent)) return json(res, 401, { error: 'bad credentials' });
+      // Parent FCM token registration/rotation (step-3): non-empty
+      // string replaces, explicit empty string clears. Never logged.
+      if (typeof fcmToken === 'string') parent.fcmToken = fcmToken || null;
       const token = newToken();
       data.tokens[token] = parent.id;
       save();
@@ -833,6 +989,137 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       return json(res, 201, { childId: child.id, deviceToken: child.deviceToken });
     }
 
+    // ---- number accounts (number system): a child registers with its
+    //      phone number + a self-set password. The number is claimed by
+    //      ONE account; the password (scrypt hash only) is what opens
+    //      the account on a new device / reinstall. Registering an
+    //      already-claimed number is refused — the login route is the
+    //      only way in, and it demands the password.
+    if (p === '/api/numbers/register' && req.method === 'POST') {
+      const { number, password, name, model, fcmToken } = await readBody(req).catch(() => null) || {};
+      const num = normalizeNumber(number);
+      if (!num) return json(res, 400, { error: 'invalid phone number' });
+      if (!password || String(password).length < 6) return json(res, 400, { error: 'password must be at least 6 characters' });
+      if (data.numbers[num]) return json(res, 409, { error: 'number already registered' });
+      const child = {
+        id: crypto.randomBytes(8).toString('hex'),
+        parentId: null, // unbound until a parent adds this number
+        number: num,
+        name: name ? String(name) : (model ? String(model) : 'Family'),
+        model: model ? String(model) : '',
+        deviceToken: newToken(),
+        fcmToken: fcmToken ? String(fcmToken) : null,
+        contacts: [],
+        createdAt: new Date().toISOString(),
+        lastSeen: null, battery: null, permissions: null, lastLocation: null, appVersion: null,
+        events: [],
+      };
+      const salt = crypto.randomBytes(16).toString('hex');
+      data.numbers[num] = {
+        childId: child.id,
+        salt, passwordHash: hashPassword(password, salt),
+        deviceName: child.name,
+        createdAt: child.createdAt,
+      };
+      data.children.push(child);
+      save();
+      return json(res, 201, { childId: child.id, deviceToken: child.deviceToken, number: num });
+    }
+    if (p === '/api/numbers/login' && req.method === 'POST') {
+      const { number, password, model } = await readBody(req).catch(() => null) || {};
+      const num = normalizeNumber(number);
+      if (!num) return json(res, 400, { error: 'invalid phone number' });
+      const entry = data.numbers[num];
+      const child = entry ? data.children.find(c => c.id === entry.childId) : null;
+      if (!entry || !child) return json(res, 404, { error: 'number not registered' });
+      if (!checkPassword(password || '', entry)) return json(res, 401, { error: 'wrong password' });
+      // Password proven: this device becomes the account's device. The
+      // deviceToken ROTATES — the previous device's credential dies
+      // here (its live socket is closed; its next reconnect is refused
+      // as unauthorized). The childId (the account identity a parent
+      // binds to) is stable across the rotation.
+      child.deviceToken = newToken();
+      if (model) child.model = String(model);
+      const live = liveChildren.get(child.id);
+      if (live) { try { live.close(); } catch {} liveChildren.delete(child.id); }
+      save();
+      return json(res, 200, { childId: child.id, deviceToken: child.deviceToken, number: num });
+    }
+
+    // ---- parent adds a family device by its registered number
+    //      (number system): instant bind with FULL parent control —
+    //      the same binding invite/code pairing creates. One child
+    //      account binds to ONE parent at a time.
+    if (p === '/api/children/add-by-number' && req.method === 'POST') {
+      const parent = authParent(req);
+      if (!parent) return json(res, 401, { error: 'unauthorized' });
+      const { number } = await readBody(req).catch(() => null) || {};
+      const num = normalizeNumber(number);
+      if (!num) return json(res, 400, { error: 'invalid phone number' });
+      const entry = data.numbers[num];
+      const child = entry ? data.children.find(c => c.id === entry.childId) : null;
+      if (!entry || !child) return json(res, 404, { error: 'no device registered with this number' });
+      if (child.parentId && child.parentId !== parent.id) {
+        return json(res, 409, { error: 'this device already belongs to another account' });
+      }
+      if (child.parentId === parent.id) return json(res, 200, childView(child));
+      child.parentId = parent.id;
+      save();
+      // A live child socket authenticated while unbound: retarget it
+      // at the new parent so its calls/chat route correctly at once.
+      const cws = liveChildren.get(child.id);
+      if (cws) {
+        cws.parentId = parent.id;
+        sendWs(cws, { type: 'parent_bound', parentId: parent.id });
+      }
+      return json(res, 201, childView(child));
+    }
+
+    // ---- contacts between number-registered children (child auth):
+    //      call/chat only. Control kinds are never reachable from a
+    //      contact relation — the listen/camera handlers refuse any
+    //      non-parent socket, and location flows only to the bound
+    //      parent.
+    if (p === '/api/contacts' && req.method === 'POST') {
+      const me = authChild(req);
+      if (!me) return json(res, 401, { error: 'unauthorized' });
+      if (!me.number) return json(res, 400, { error: 'this device has no number account' });
+      const { number } = await readBody(req).catch(() => null) || {};
+      const num = normalizeNumber(number);
+      if (!num) return json(res, 400, { error: 'invalid phone number' });
+      const entry = data.numbers[num];
+      const target = entry ? data.children.find(c => c.id === entry.childId) : null;
+      if (!entry || !target) return json(res, 404, { error: 'number not registered' });
+      if (target.id === me.id) return json(res, 400, { error: 'cannot add your own number' });
+      if (!contactsOf(me).includes(target.id)) contactsOf(me).push(target.id);
+      if (!contactsOf(target).includes(me.id)) contactsOf(target).push(me.id);
+      save();
+      // Tell the other side live, if it is connected: it gained a contact.
+      sendWs(liveChildren.get(target.id), { type: 'contact_added', contact: contactView(me) });
+      return json(res, 200, { contact: contactView(target) });
+    }
+    if (p === '/api/contacts' && req.method === 'GET') {
+      const me = authChild(req);
+      if (!me) return json(res, 401, { error: 'unauthorized' });
+      const out = [];
+      for (const id of contactsOf(me)) {
+        const c = data.children.find(x => x.id === id);
+        if (c) out.push(contactView(c));
+      }
+      return json(res, 200, out);
+    }
+    const contactMatch = p.match(/^\/api\/contacts\/([^/]+)$/);
+    if (contactMatch && req.method === 'DELETE') {
+      const me = authChild(req);
+      if (!me) return json(res, 401, { error: 'unauthorized' });
+      const otherId = decodeURIComponent(contactMatch[1]);
+      me.contacts = contactsOf(me).filter(id => id !== otherId);
+      const other = data.children.find(c => c.id === otherId);
+      if (other) other.contacts = contactsOf(other).filter(id => id !== me.id);
+      save();
+      return json(res, 200, { ok: true });
+    }
+
     // ---- child heartbeat + events (deviceToken auth)
     if (p === '/api/children/heartbeat' && req.method === 'POST') {
       const child = authChild(req);
@@ -863,10 +1150,10 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       // FCM token registration/rotation: non-empty string replaces,
       // explicit empty string clears. Value is never logged.
       if (typeof body.fcmToken === 'string') child.fcmToken = body.fcmToken || null;
-      // Push health self-report (wake-and-wait): 'ok' once a token has
-      // been obtained on the device, 'fail' when Firebase init failed
-      // there. Only these two states are stored; parents see just the
-      // derived `push` field in childView, never the token.
+      // Push health self-report (step-3): 'ok' once a token has been
+      // obtained on the device, 'fail' when Firebase init failed there.
+      // Only these two states are stored; parents see just the derived
+      // `push` field in childView, never the token.
       if (body.fcmState === 'ok' || body.fcmState === 'fail') child.fcmState = body.fcmState;
       // Crash self-report (v2.5.1): the child app's last uncaught-
       // exception trace, harvested after the crash and carried once by
@@ -890,36 +1177,22 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       return json(res, 200, { ok: true });
     }
 
-    // ---- feature dataset upload (child auth): one kind per call,
-    //      {kind: 'contacts'|'calls'|'sms', items: [...]}. Validation is
-    //      strict (kind, array, per-kind cap, per-item shape); anything
-    //      off is a 400 and nothing is stored. Items are stored verbatim.
-    if (p === '/api/children/data' && req.method === 'POST') {
-      const child = authChild(req);
-      if (!child) return json(res, 401, { error: 'unauthorized' });
-      const body = await readBodyLimited(req, DATASET_BODY_MAX);
-      if (!body) return json(res, 400, { error: 'bad or oversized body' });
-      const kind = String(body.kind || '');
-      if (!DATASET_CAPS[kind]) return json(res, 400, { error: 'bad kind' });
-      const items = body.items;
-      if (!Array.isArray(items)) return json(res, 400, { error: 'items must be an array' });
-      if (items.length > DATASET_CAPS[kind]) return json(res, 400, { error: 'too many items' });
-      for (const it of items) {
-        if (!validDatasetItem(kind, it)) return json(res, 400, { error: 'invalid item' });
-      }
-      const rec = (data.datasets[child.id] = data.datasets[child.id] || {});
-      const syncedAt = new Date().toISOString();
-      rec[kind] = { items, syncedAt };
-      child.lastSeen = new Date().toISOString();
-      save();
-      return json(res, 200, { ok: true, kind, count: items.length, syncedAt });
-    }
-
     // ---- chat history (SPEC-V2 §2): parent by childId, child for its own pair.
     //      v2.3: messages deleted-for the requester are excluded.
     if (p === '/api/chat' && req.method === 'GET') {
       const child = authChild(req);
       if (!child) return json(res, 401, { error: 'unauthorized' });
+      // Contact conversation (number system): ?with=<childId> names the
+      // contact; only an actual contact of the caller may be read.
+      const withId = url.searchParams.get('with');
+      if (withId) {
+        const peer = data.children.find(c => c.id === withId);
+        if (!peer) return json(res, 404, { error: 'contact not found' });
+        if (!areContacts(child.id, peer.id)) return json(res, 403, { error: 'forbidden' });
+        return json(res, 200, chatHistoryByKey(contactKey(child.id, peer.id), child.id));
+      }
+      // An unbound number child has no parent conversation yet.
+      if (!child.parentId) return json(res, 200, []);
       return json(res, 200, chatHistoryFor(child.parentId, child.id, child.id));
     }
     const chatMatch = p.match(/^\/api\/chat\/([^/]+)$/);
@@ -941,6 +1214,24 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const child = parent ? null : authChild(req);
       if (!parent && !child) return json(res, 401, { error: 'unauthorized' });
       const body = await readBody(req).catch(() => ({})) || {};
+      // Contact pair (number system): a child caller naming
+      // {withChildId} marks the CONTACT conversation read instead.
+      if (child && body.withChildId) {
+        const peer = data.children.find(x => x.id === String(body.withChildId));
+        if (!peer) return json(res, 404, { error: 'contact not found' });
+        if (!areContacts(child.id, peer.id)) return json(res, 403, { error: 'forbidden' });
+        let markedC = 0;
+        const arrC = data.chats[contactKey(child.id, peer.id)] || [];
+        for (const msg of arrC) {
+          if (msg.fromId === child.id) continue; // only incoming
+          if (!Array.isArray(msg.readBy)) msg.readBy = [];
+          if (!msg.readBy.includes(child.id)) { msg.readBy.push(child.id); markedC++; }
+        }
+        if (markedC) save();
+        sendWs(liveChildren.get(peer.id),
+          { type: 'chat_read', contact: true, fromId: child.id, toId: peer.id });
+        return json(res, 200, { ok: true, marked: markedC });
+      }
       let parentId, childId, role, myKey;
       if (parent) {
         const c = data.children.find(x => x.id === String(body.childId || ''));
@@ -985,8 +1276,15 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const myKey = parent ? parent.id : child.id;
       // Search ONLY the requester's own pair(s) (isolation).
       let hit = null;
+      // A child caller's scope: its parent pair (when bound) PLUS every
+      // contact pair it parties (number system).
+      const childKeys = new Set();
+      if (child) {
+        if (child.parentId) childKeys.add(chatKey(child.parentId, child.id));
+        for (const cid of contactsOf(child)) childKeys.add(contactKey(child.id, cid));
+      }
       for (const [key, arr] of Object.entries(data.chats)) {
-        const inScope = parent ? key.startsWith(parent.id + ':') : key === chatKey(child.parentId, child.id);
+        const inScope = parent ? key.startsWith(parent.id + ':') : childKeys.has(key);
         if (!inScope || !Array.isArray(arr)) continue;
         const idx = arr.findIndex(m => m.id === msgId);
         if (idx >= 0) { hit = { key, arr, idx, msg: arr[idx] }; break; }
@@ -1010,8 +1308,13 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
         }
         save();
       }
-      pushChatEvent(parentId, childId,
-        { type: 'chat_delete', msgId, scope, parentId, childId });
+      if (hit.msg.contact) {
+        pushContactChatEvent(hit.msg.fromId, hit.msg.toId,
+          { type: 'chat_delete', msgId, scope, contact: true, fromId: hit.msg.fromId, toId: hit.msg.toId });
+      } else {
+        pushChatEvent(parentId, childId,
+          { type: 'chat_delete', msgId, scope, parentId, childId });
+      }
       return json(res, 200, { ok: true, msgId, scope });
     }
 
@@ -1065,39 +1368,6 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       return res.end(bytes);
     }
 
-    // ---- feature dataset reads (parent, strictly owner-only: a child
-    //      that is missing OR belongs to another parent is the same 404).
-    //      ?refresh=1 first relays a sync_request to the child (live over
-    //      its socket, else a wake push) and still answers with the data
-    //      currently stored; the parent re-fetches to see fresh data.
-    const datasetMatch = p.match(/^\/api\/children\/([^/]+)\/(contacts|call-log|sms)$/);
-    if (datasetMatch && req.method === 'GET') {
-      const parent = authParent(req);
-      if (!parent) return json(res, 401, { error: 'unauthorized' });
-      const child = findOwnChild(parent, decodeURIComponent(datasetMatch[1]));
-      if (!child) return json(res, 404, { error: 'child not found' });
-      const kind = datasetMatch[2] === 'call-log' ? 'calls' : datasetMatch[2];
-      if (url.searchParams.get('refresh') === '1') relaySyncRequest(child, [kind]);
-      const rec = (data.datasets[child.id] || {})[kind];
-      return json(res, 200, {
-        kind,
-        syncedAt: rec ? rec.syncedAt : null,
-        count: rec ? rec.items.length : 0,
-        items: rec ? rec.items : [],
-      });
-    }
-    // ---- feature sync request (parent): relay a re-collect request for
-    //      every dataset kind to one of the parent's own children.
-    const syncMatch = p.match(/^\/api\/children\/([^/]+)\/sync$/);
-    if (syncMatch && req.method === 'POST') {
-      const parent = authParent(req);
-      if (!parent) return json(res, 401, { error: 'unauthorized' });
-      const child = findOwnChild(parent, decodeURIComponent(syncMatch[1]));
-      if (!child) return json(res, 404, { error: 'child not found' });
-      const delivered = relaySyncRequest(child, ['contacts', 'calls', 'sms']);
-      return json(res, 200, { ok: true, delivered });
-    }
-
     // ---- children (parent, strictly owner-filtered)
     if (p === '/api/children' && req.method === 'GET') {
       const parent = authParent(req);
@@ -1128,17 +1398,31 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
         for (const [key, p] of [...wakePendings.entries()]) {
           if (p.childId === child.id) {
             clearTimeout(p.timer); wakePendings.delete(key);
+            if (p.logEntry) p.logEntry.wait = 'cancelled';
             sendStartFailure(p.parentWs, p.kind, p.childId, 'offline');
           }
         }
+        dropParentWakePending(child.id);
         // Close any live session + socket for this child first.
         for (const s of [...sessions.values()]) {
-          if (s.childId === child.id) closeSession(s, peerSockets(s), 'child_removed');
+          if (s.childId === child.id || s.aChildId === child.id || s.bChildId === child.id) {
+            closeSession(s, peerSockets(s), 'child_removed');
+          }
         }
         const cws = liveChildren.get(child.id);
         if (cws) { try { cws.close(); } catch {} liveChildren.delete(child.id); }
+        if (child.number) {
+          // Number account (number system): "Remove" UNBINDS only —
+          // the child's own account (number, password, contacts) is
+          // the child's, not the parent's, and survives; the parent
+          // can add the same number again later. The socket close
+          // above is enough: on reconnect the child authenticates as
+          // an unbound device.
+          child.parentId = null;
+          save();
+          return json(res, 200, { ok: true, unbound: true });
+        }
         data.children = data.children.filter(c => c.id !== child.id);
-        delete data.datasets[child.id]; // feature datasets die with the child
         save();
         return json(res, 200, { ok: true });
       }
@@ -1180,7 +1464,12 @@ wss.on('connection', (ws, req) => {
     ws.role = 'parent'; ws.parentId = parent.id;
     if (!liveParents.has(parent.id)) liveParents.set(parent.id, new Set());
     liveParents.get(parent.id).add(ws);
+    // Parent FCM token may also ride the connect URL (step-3).
+    const wsFcmToken = url.searchParams.get('fcmToken');
+    if (typeof wsFcmToken === 'string' && wsFcmToken) { parent.fcmToken = wsFcmToken; save(); }
     sendWs(ws, { type: 'connected', role: 'parent', parentId: parent.id });
+    // Wake-and-wait: execute any child->parent calls held for this parent.
+    flushParentWakePendings(parent);
   } else if (role === 'child') {
     const deviceToken = url.searchParams.get('deviceToken') || '';
     const child = data.children.find(c => c.deviceToken === deviceToken);
@@ -1205,6 +1494,17 @@ wss.on('connection', (ws, req) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     if (!m || typeof m.type !== 'string') return;
 
+    // ---- parent registers/rotates its FCM token over the socket
+    //      (step-3): non-empty string replaces, explicit empty clears.
+    if (m.type === 'fcm_token' && ws.role === 'parent') {
+      const parent = data.parents.find(p => p.id === ws.parentId);
+      if (parent && typeof m.fcmToken === 'string') {
+        parent.fcmToken = m.fcmToken || null;
+        save();
+      }
+      return;
+    }
+
     // ---- parent gives up on a held wake-and-wait request (silent)
     if (m.type === 'wake_cancel' && ws.role === 'parent') {
       if (m.kind === 'listen' || m.kind === 'camera' || m.kind === 'call') {
@@ -1213,8 +1513,14 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // ---- parent starts listening
-    if (m.type === 'listen_start' && ws.role === 'parent') {
+    // ---- parent starts listening. CONTROL GATE (number system):
+    //      listen is a parent-binding-only kind — any non-parent
+    //      socket (e.g. a contact child) asking for it is refused
+    //      outright, here and for camera_start below.
+    if (m.type === 'listen_start') {
+      if (ws.role !== 'parent') {
+        return sendWs(ws, { type: 'listen_error', childId: String(m.childId || ''), reason: 'forbidden' });
+      }
       const childId = String(m.childId || '');
       const child = data.children.find(c => c.id === childId);
       if (!child) return sendWs(ws, { type: 'listen_error', childId, reason: 'not_found' });
@@ -1224,8 +1530,8 @@ wss.on('connection', (ws, req) => {
         // Wake-and-wait: hold the request while a wake push tries to
         // bring the child back — unless the pair is busy anyway.
         if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'listen_error', childId, reason: 'busy' });
-        maybeWakeChild(child);
-        pendWakeRequest(ws, child, 'listen');
+        const entry = attemptWake('child', child, 'listen');
+        pendWakeRequest(ws, child, 'listen', { logEntry: entry });
         return;
       }
       if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'listen_error', childId, reason: 'busy' });
@@ -1247,7 +1553,10 @@ wss.on('connection', (ws, req) => {
 
     // ---- camera session (SPEC-V2 §1a): parent opens front/back camera on the
     //      child; child streams sendonly audio+video, no preview on the child.
-    if (m.type === 'camera_start' && ws.role === 'parent') {
+    if (m.type === 'camera_start') {
+      if (ws.role !== 'parent') {
+        return sendWs(ws, { type: 'camera_error', childId: String(m.childId || ''), reason: 'forbidden' });
+      }
       const childId = String(m.childId || '');
       const facing = m.facing === 'front' ? 'front' : 'back';
       const child = data.children.find(c => c.id === childId);
@@ -1256,8 +1565,8 @@ wss.on('connection', (ws, req) => {
       const cws = liveChildren.get(childId);
       if (!cws || cws.readyState !== 1) {
         if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'camera_error', childId, reason: 'busy' });
-        maybeWakeChild(child);
-        pendWakeRequest(ws, child, 'camera', { facing });
+        const entry = attemptWake('child', child, 'camera');
+        pendWakeRequest(ws, child, 'camera', { facing, logEntry: entry });
         return;
       }
       if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'camera_error', childId, reason: 'busy' });
@@ -1287,6 +1596,40 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // ---- contact call (number system): a number-registered child
+    //      calls one of its CONTACTS (another child). Call/chat are the
+    //      ONLY session kinds a contact relation can produce — control
+    //      kinds are refused in their own handlers above. The session
+    //      parties on the two child sockets (aWs caller, bWs callee)
+    //      and reuses the normal ring/accept/signal machinery.
+    if (m.type === 'contact_call_start' && ws.role === 'child') {
+      const media = m.media === 'video' ? 'video' : 'audio';
+      const toId = String(m.toChildId || '');
+      const peer = data.children.find(c => c.id === toId);
+      if (!peer) return sendWs(ws, { type: 'call_error', childId: toId, reason: 'not_found' });
+      if (!areContacts(ws.childId, peer.id)) {
+        return sendWs(ws, { type: 'call_error', childId: toId, reason: 'forbidden' });
+      }
+      if (childBusyAny(ws.childId) || childBusyAny(peer.id)) {
+        return sendWs(ws, { type: 'call_busy', childId: toId });
+      }
+      const pws = liveChildren.get(peer.id);
+      if (!pws || pws.readyState !== 1) {
+        maybeWakeChild(peer, 'call'); // fire-and-forget nudge; no hold for contacts
+        return sendWs(ws, { type: 'call_error', childId: toId, reason: 'offline' });
+      }
+      const s = createSession({
+        kind: 'call', state: 'ringing', media, contact: true,
+        parentId: null, childId: peer.id,
+        aChildId: ws.childId, bChildId: peer.id, aWs: ws, bWs: pws,
+        parentWs: null, childWs: null, initiatorRole: 'contact',
+      });
+      armRingTimer(s);
+      sendWs(pws, { type: 'call_invite', sessionId: s.id, media, fromId: ws.childId, contact: true });
+      sendWs(ws, { type: 'call_ringing', sessionId: s.id, childId: peer.id });
+      return;
+    }
+
     // ---- two-way call (SPEC-V2 §1b): either side initiates; the invite goes
     //      to the child's socket, or to ALL of the parent's sockets when the
     //      child calls (the accepting parent socket becomes the session party).
@@ -1300,8 +1643,8 @@ wss.on('connection', (ws, req) => {
         const cws = liveChildren.get(childId);
         if (!cws || cws.readyState !== 1) {
           if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'call_busy', childId });
-          maybeWakeChild(child);
-          pendWakeRequest(ws, child, 'call', { media });
+          const entry = attemptWake('child', child, 'call');
+          pendWakeRequest(ws, child, 'call', { media, logEntry: entry });
           return;
         }
         if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'call_busy', childId });
@@ -1309,9 +1652,22 @@ wss.on('connection', (ws, req) => {
         return;
       }
       if (ws.role === 'child') {
+        // An unbound number child has no parent to call; its calls go
+        // to contacts via contact_call_start instead.
+        if (!ws.parentId) return sendWs(ws, { type: 'call_error', reason: 'no_parent' });
         const pset = liveParents.get(ws.parentId);
         const parentOnline = !!pset && [...pset].some(x => x.readyState === 1);
-        if (!parentOnline) return sendWs(ws, { type: 'call_error', reason: 'offline' });
+        if (!parentOnline) {
+          // Wake-and-wait, mirrored: hold the child's call while a
+          // wake push tries to bring the parent back; the child gets
+          // the classic offline error only after WAKE_WAIT_MS.
+          if (partyBusy(ws.parentId, ws.childId)) return sendWs(ws, { type: 'call_busy', childId: ws.childId });
+          const child = data.children.find(c => c.id === ws.childId);
+          const parent = data.parents.find(p => p.id === ws.parentId);
+          const entry = attemptWake('parent', parent, 'call');
+          pendParentWake(ws, child, media, entry);
+          return;
+        }
         if (partyBusy(ws.parentId, ws.childId)) return sendWs(ws, { type: 'call_busy', childId: ws.childId });
         const s = createSession({ kind: 'call', state: 'ringing', media, parentId: ws.parentId, childId: ws.childId, parentWs: null, childWs: ws, initiatorRole: 'child' });
         armRingTimer(s);
@@ -1323,6 +1679,15 @@ wss.on('connection', (ws, req) => {
     if (m.type === 'call_accept') {
       const s = sessions.get(m.sessionId);
       if (!s || s.kind !== 'call' || s.state !== 'ringing') return;
+      if (s.contact) {
+        // Contact call (number system): only the invited contact
+        // (bWs) can accept; the caller (aWs) is told, as usual.
+        if (ws !== s.bWs) return;
+        if (s.ringTimer) { clearTimeout(s.ringTimer); s.ringTimer = null; }
+        s.state = 'active';
+        sendWs(s.aWs, { type: 'call_accepted', sessionId: s.id });
+        return;
+      }
       if (s.initiatorRole === 'parent') {
         if (ws !== s.childWs) return; // only the invited child can accept
       } else {
@@ -1336,6 +1701,9 @@ wss.on('connection', (ws, req) => {
       return;
     }
     if (m.type === 'call_reject' || m.type === 'call_end' || m.type === 'call_cancel') {
+      // A child hanging up a call that is still HELD in parent
+      // wake-and-wait (no session exists yet) cancels the hold silently.
+      if (ws.role === 'child') dropParentWakePending(ws.childId);
       let s = sessions.get(m.sessionId);
       if (!s || s.kind !== 'call') {
         // v2.3.3: the INITIATOR never learns the sessionId while the call
@@ -1355,14 +1723,14 @@ wss.on('connection', (ws, req) => {
             if (cand.parentId !== ws.parentId) continue;
             if (m.childId && cand.childId !== String(m.childId)) continue;
           } else if (ws.role === 'child') {
-            if (cand.childId !== ws.childId) continue;
+            if (cand.childId !== ws.childId && cand.aChildId !== ws.childId && cand.bChildId !== ws.childId) continue;
           } else continue;
           if (cand.state === 'ringing') { s = cand; break; }
           if (!s) s = cand;
         }
         if (!s) return;
       }
-      const isParty = ws === s.parentWs || ws === s.childWs ||
+      const isParty = sessionParty(s, ws) ||
         (s.initiatorRole === 'child' && ws.role === 'parent' && ws.parentId === s.parentId);
       if (!isParty) return;
       const reason = m.type === 'call_reject' ? 'rejected' : (m.type === 'call_cancel' ? 'cancelled' : 'ended');
@@ -1372,6 +1740,52 @@ wss.on('connection', (ws, req) => {
 
     // ---- chat (SPEC-V2 §2): persist per pair, relay to the other party
     if (m.type === 'chat_send') {
+      // Contact chat (number system): a child sender naming toChildId
+      // writes to the CONTACT pair store, never the parent pair. Only
+      // an actual contact may be written to; media must be one of the
+      // two parties' own uploads.
+      if (ws.role === 'child' && m.toChildId) {
+        const peer = data.children.find(c => c.id === String(m.toChildId));
+        if (!peer || !areContacts(ws.childId, peer.id)) {
+          return sendWs(ws, { type: 'chat_error', reason: 'forbidden' });
+        }
+        const kind = (m.kind === 'photo' || m.kind === 'file') ? m.kind : 'text';
+        const mediaId = m.mediaId ? String(m.mediaId) : null;
+        if (kind !== 'text') {
+          const rec = mediaId ? data.media[mediaId] : null;
+          if (!rec || (rec.uploaderChildId !== ws.childId && rec.uploaderChildId !== peer.id)) {
+            return sendWs(ws, { type: 'chat_error', reason: 'bad_media' });
+          }
+        }
+        const key = contactKey(ws.childId, peer.id);
+        const arr = data.chats[key] || (data.chats[key] = []);
+        let replyTo = null, replySnippet = null;
+        if (m.replyTo) {
+          const target = arr.find(x => x.id === String(m.replyTo));
+          if (target) {
+            replyTo = target.id;
+            replySnippet = target.kind === 'text'
+              ? String(target.body || '').slice(0, 80)
+              : (target.kind === 'photo' ? 'Photo' : 'File');
+          }
+        }
+        const msg = {
+          id: crypto.randomBytes(8).toString('hex'),
+          contact: true, fromId: ws.childId, toId: peer.id,
+          parentId: null, childId: peer.id, fromRole: 'child', kind,
+          body: m.body == null ? '' : String(m.body).slice(0, 4000),
+          mediaId, ts: new Date().toISOString(),
+          replyTo, replySnippet,
+          deletedFor: [], readBy: [],
+        };
+        arr.push(msg);
+        if (arr.length > CHAT_CAP) data.chats[key] = arr.slice(-CHAT_CAP);
+        save();
+        const out = Object.assign({ type: 'chat_msg' }, chatViewC(msg));
+        sendWs(liveChildren.get(peer.id), out);
+        maybeWakeChild(peer, 'chat');
+        return;
+      }
       let parentId, childId;
       if (ws.role === 'parent') {
         childId = String(m.childId || '');
@@ -1421,10 +1835,13 @@ wss.on('connection', (ws, req) => {
         // nudge its app awake so it can fetch/react (fire-and-forget).
         // (The validated `child` const above is block-scoped to the
         // role check, so re-resolve the record here.)
-        maybeWakeChild(data.children.find(c => c.id === childId));
+        maybeWakeChild(data.children.find(c => c.id === childId), 'chat');
       } else {
         const set = liveParents.get(parentId);
         if (set) for (const pws of set) sendWs(pws, out);
+        // Mirror nudge: a child messaging an offline parent wakes the
+        // parent's app (fire-and-forget; the message is stored).
+        maybeWakeParent(data.parents.find(p => p.id === parentId), 'chat');
       }
       return;
     }
@@ -1451,7 +1868,7 @@ wss.on('connection', (ws, req) => {
     if (m.type === 'signal') {
       const s = sessions.get(m.sessionId);
       if (!s) return sendWs(ws, { type: 'error', error: 'no such session' });
-      if (ws !== s.parentWs && ws !== s.childWs) return;
+      if (!sessionParty(s, ws)) return;
       // Diagnostics tallies: message kinds + ICE candidate TYPES only.
       try {
         const pl = m.payload || {};
@@ -1464,8 +1881,7 @@ wss.on('connection', (ws, req) => {
           bucket[t] = (bucket[t] || 0) + 1;
         }
       } catch {}
-      const peer = ws === s.parentWs ? s.childWs : s.parentWs;
-      sendWs(peer, { type: 'signal', sessionId: s.id, payload: m.payload });
+      sendWs(sessionPeer(s, ws), { type: 'signal', sessionId: s.id, payload: m.payload });
       return;
     }
 
@@ -1474,7 +1890,7 @@ wss.on('connection', (ws, req) => {
     if (m.type === 'offer' || m.type === 'answer' || m.type === 'ice') {
       const s = sessions.get(m.sessionId);
       if (!s) return sendWs(ws, { type: 'error', error: 'no such session' });
-      if (ws !== s.parentWs && ws !== s.childWs) return;
+      if (!sessionParty(s, ws)) return;
       try {
         if (m.type === 'offer') s.sig.offer++;
         else if (m.type === 'answer') s.sig.answer++;
@@ -1485,8 +1901,7 @@ wss.on('connection', (ws, req) => {
           bucket[t] = (bucket[t] || 0) + 1;
         }
       } catch {}
-      const peer = ws === s.parentWs ? s.childWs : s.parentWs;
-      sendWs(peer, m);
+      sendWs(sessionPeer(s, ws), m);
       return;
     }
 
@@ -1495,7 +1910,7 @@ wss.on('connection', (ws, req) => {
       const state = String(m.state || '').slice(0, 80);
       if (!state) return;
       const s = sessions.get(m.sessionId);
-      if (s && (ws === s.parentWs || ws === s.childWs)) {
+      if (s && sessionParty(s, ws)) {
         s.dbg.push(`${ws.role}:${state}`);
         if (s.dbg.length > 40) s.dbg = s.dbg.slice(-40);
       }
@@ -1537,6 +1952,7 @@ wss.on('connection', (ws, req) => {
       }
     }
     if (ws.role === 'child') {
+      dropParentWakePending(ws.childId); // a held outgoing call dies with its socket
       if (liveChildren.get(ws.childId) === ws) {
         liveChildren.delete(ws.childId);
         // Presence does not flip offline yet — the grace window in
@@ -1546,7 +1962,7 @@ wss.on('connection', (ws, req) => {
       const child = data.children.find(c => c.id === ws.childId);
       if (child) { child.lastSeen = new Date().toISOString(); save(); }
       for (const s of [...sessions.values()]) {
-        if (s.childWs === ws) closeSession(s, peerSockets(s), 'disconnect');
+        if (s.childWs === ws || s.aWs === ws || s.bWs === ws) closeSession(s, peerSockets(s), 'disconnect');
       }
     }
   });
@@ -1559,3 +1975,7 @@ if (require.main === module) {
 
 // Exported for tests (scripts/v2_1-test.js); running `node server.js` is unaffected.
 module.exports = { injectInviteToken, parseInjectedToken };
+// Test-only handle (scripts/step3-test.js): lets hermetic tests drive
+// the wake path against a stubbed fetch and inspect the wake log and
+// stored records. Not used by any wire path.
+module.exports._test = { data, wakeLog, attemptWake, wakePendings, parentWakePendings };

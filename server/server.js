@@ -17,6 +17,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const fcm = require('./fcm');
+const { createMediaStore } = require('./media-store');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const DATA_FILE = process.env.DATA_FILE
@@ -204,6 +205,37 @@ async function firestoreWriteDoc(jsonStr) {
   });
   if (!res.ok) throw new Error('firestore_patch_http_' + res.status);
 }
+// ------------------------------------------------- chat-media bytes
+// The bytes behind data.media used to live ONLY as files in
+// MEDIA_DIR — the same ephemeral disk as data.json — so every
+// redeploy/sleep destroyed them while their messages lived on
+// ("sent photos never open again"). The byte store is now pluggable
+// (media-store.js): MEDIA_BACKEND=file (default) is the historical
+// local-dir behavior and the rollback path; MEDIA_BACKEND=firestore
+// stores the bytes chunked inside Firestore itself
+// ("firestore-chunks": ~700 KB documents in mediaChunks + a manifest
+// in mediaMeta per object, sha256-verified on serve), because
+// Firebase Storage cannot be enabled on this project without a
+// Blaze billing upgrade. Auth reuses getDatastoreToken above — the
+// same JWT -> OAuth2 mechanism, datastore scope. The upload cap is
+// MEDIA_MAX_BYTES (10 MB) in BOTH modes, so an oversize upload gets
+// the historical 413 shape regardless of backend. MEDIA_BACKEND=
+// firestore with no valid service account warns and falls back to
+// file, mirroring STORAGE_MODE's never-break-requests policy.
+const MEDIA_BACKEND = (() => {
+  const req = String(process.env.MEDIA_BACKEND || '').toLowerCase();
+  if (req === 'firestore') {
+    if (storageSA) return 'firestore';
+    console.warn('[media] MEDIA_BACKEND=firestore requested but FIREBASE_SERVICE_ACCOUNT is missing/invalid — falling back to file backend');
+  }
+  return 'file';
+})();
+const mediaStore = createMediaStore({
+  backend: MEDIA_BACKEND,
+  mediaDir: MEDIA_DIR,
+  serviceAccount: storageSA,
+  getToken: getDatastoreToken,
+});
 let persistTimer = null;
 let persistInFlight = false;
 let persistDirty = false;
@@ -699,7 +731,11 @@ function childBusyAny(childId) {
 // hashes (the same hashPassword/checkPassword helpers the parent
 // accounts use — Node built-in crypto, no new dependencies).
 // ---------------------------------------------------------------------------
-function normalizeNumber(raw) {
+// The legacy normalizer, kept byte-identical (link release step 1,
+// 2026-11-05): every input WITHOUT an explicit international prefix
+// ('+' or '00') funnels through here exactly as before, so all
+// existing accounts — above all the BD forms below — keep matching.
+function normalizeNumberLegacy(raw) {
   const s = String(raw == null ? '' : raw).replace(/[\s\-()]/g, '');
   if (!/^\+?\d{6,15}$/.test(s)) return null;
   // Bangladeshi equivalence (owner audit 2026-11-05, decision #3):
@@ -714,6 +750,69 @@ function normalizeNumber(raw) {
   }
   return s;
 }
+// ---------------------------------------------------------------------------
+// International canonicalization (link release step 1, owner design
+// 2026-11-05): the apps now offer a country picker, so a number can
+// arrive from ANY country as (dial code + national digits the user
+// typed). shared/countries.json — the same table both apps ship — is
+// the single source of truth for the dial-code set. An explicitly
+// international input ('+' or '00' prefix) is canonicalized to E.164:
+// longest-match the dial code, collapse a duplicated dial code the
+// user pasted ("+880 880 1712..."), strip ONE trunk leading 0 from
+// the national part ("+91 09876543210" -> "+919876543210"). Anything
+// without an international prefix goes through the legacy path above,
+// byte-identical — canonical stored forms therefore never change for
+// existing accounts (+880... and +1... canonicalize to themselves).
+// ---------------------------------------------------------------------------
+const COUNTRY_DIALS = (() => {
+  try {
+    const list = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'shared', 'countries.json'), 'utf8'));
+    const set = new Set();
+    for (const c of list) { const d = String(c && c.dial || ''); if (/^\d{1,4}$/.test(d)) set.add(d); }
+    // Longest first, so e.g. "1242" (Bahamas) wins over "1" (NANP).
+    return [...set].sort((a, b) => b.length - a.length);
+  } catch (e) {
+    console.error('[numbers] shared/countries.json unavailable; international inputs pass through as before:', e.message);
+    return [];
+  }
+})();
+function matchDialCode(digits) {
+  for (const d of COUNTRY_DIALS) if (digits.startsWith(d)) return d;
+  return null;
+}
+function canonicalizeNumber(raw) {
+  const s = String(raw == null ? '' : raw).replace(/[\s\-()]/g, '');
+  let digits = null;
+  if (s[0] === '+') digits = s.slice(1);
+  else if (s.startsWith('00')) digits = s.slice(2);
+  if (digits === null) return normalizeNumberLegacy(raw);
+  if (!/^\d+$/.test(digits)) return null;
+  const dial = matchDialCode(digits);
+  if (!dial) {
+    // Unknown country code: the historical pass-through, unchanged
+    // (any 6-15 digit international string is kept as typed).
+    return (digits.length >= 6 && digits.length <= 15) ? '+' + digits : null;
+  }
+  let national = digits.slice(dial.length);
+  // A full international number pasted after the picked country code
+  // ("+880 880 1712..."): collapse the duplication. The guard is
+  // deliberately strict — the pre-collapse national part must be at
+  // least 12 digits (longer than any genuine national number) and
+  // removing the duplicate must leave a plausible 6-12 digits — so a
+  // genuine number whose national part merely STARTS with the dial
+  // digits (e.g. an Indian mobile beginning 91...) is never mangled.
+  while (national.length >= 12 && national.startsWith(dial) && national.length - dial.length >= 6 && national.length - dial.length <= 12) {
+    national = national.slice(dial.length);
+  }
+  // One trunk leading 0 ("+966 05..." -> "+9665...").
+  if (national[0] === '0') national = national.slice(1);
+  const total = dial.length + national.length;
+  if (!national || total < 7 || total > 15) return null; // E.164 bounds
+  return '+' + dial + national;
+}
+// Public wrapper: every number entry point (register, login,
+// add-by-number, add-contact) calls this, exactly as before.
+function normalizeNumber(raw) { return canonicalizeNumber(raw); }
 function contactsOf(child) {
   if (!Array.isArray(child.contacts)) child.contacts = [];
   return child.contacts;
@@ -805,6 +904,28 @@ function chatHistoryByKey(key, viewerKey) {
 }
 function chatHistoryFor(parentId, childId, viewerKey) {
   return chatHistoryByKey(chatKey(parentId, childId), viewerKey);
+}
+/**
+ * Step 3.5: may this caller fetch media [rec] because they party a
+ * chat that references it? Parties are read off the referencing
+ * messages themselves (parentId/childId for pair chats, fromId/toId
+ * for contact chats); a message the caller deleted-for-themselves
+ * does not count. This is what lets a contact-chat receiver — or a
+ * forward recipient — open media the uploader-owner rule alone
+ * would 403, while a true third party still gets 403.
+ */
+function mediaPartyAllowed(rec, parent, child) {
+  const myId = parent ? parent.id : child.id;
+  for (const arr of Object.values(data.chats)) {
+    if (!Array.isArray(arr)) continue;
+    for (const m of arr) {
+      if (!m || m.mediaId !== rec.id) continue;
+      if (Array.isArray(m.deletedFor) && m.deletedFor.includes(myId)) continue;
+      if (m.contact) { if (m.fromId === myId || m.toId === myId) return true; }
+      else if (parent ? m.parentId === myId : m.childId === myId) return true;
+    }
+  }
+  return false;
 }
 // Push a chat event to both live sockets of a contact pair.
 function pushContactChatEvent(aId, bId, obj) {
@@ -994,6 +1115,10 @@ const server = http.createServer(async (req, res) => {
           lastPersistAt: storageStats.lastPersistAt,
           persistErrors: storageStats.persistErrors,
         },
+        // Chat-media byte backend (step 3.5, additive): 'file' =
+        // local media dir; 'firestore' = chunked Firestore documents
+        // ("firestore-chunks", see media-store.js).
+        mediaBackend: MEDIA_BACKEND,
       });
     }
 
@@ -1522,7 +1647,9 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
           const stillReferenced = Object.values(data.chats)
             .some(a => Array.isArray(a) && a.some(m => m.mediaId === mediaId));
           if (!stillReferenced) {
-            try { fs.unlinkSync(path.join(MEDIA_DIR, mediaId)); } catch {}
+            // Last reference gone: the bytes go too (whichever
+            // backend holds them — local file or Firestore chunks).
+            await mediaStore.del(mediaId).catch(() => {});
             delete data.media[mediaId];
           }
         }
@@ -1546,8 +1673,10 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const { buf, size, tooLarge } = await readRawBody(req, MEDIA_MAX_BYTES);
       if (tooLarge) return json(res, 413, { error: 'file too large (max 10 MB)' });
       const mediaId = crypto.randomBytes(16).toString('hex');
-      try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-      fs.writeFileSync(path.join(MEDIA_DIR, mediaId), buf);
+      try {
+        await mediaStore.put(mediaId, buf,
+          String(req.headers['content-type'] || 'application/octet-stream'));
+      } catch { return json(res, 500, { error: 'media store failed' }); }
       data.media[mediaId] = {
         id: mediaId,
         ownerParentId: parent ? parent.id : child.parentId,
@@ -1561,7 +1690,7 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const idsByAge = Object.keys(data.media).sort((a, b) => data.media[a].ts - data.media[b].ts);
       while (idsByAge.length > MEDIA_MAX_FILES) {
         const old = idsByAge.shift();
-        try { fs.unlinkSync(path.join(MEDIA_DIR, old)); } catch {}
+        mediaStore.del(old).catch(() => {});
         delete data.media[old];
       }
       save();
@@ -1580,10 +1709,15 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       if (parent) allowed = parent.id === rec.ownerParentId;
       else if (child) allowed = child.parentId === rec.ownerParentId &&
         (rec.uploaderChildId === null || rec.uploaderChildId === child.id);
+      // Step 3.5: a party of any chat that REFERENCES this media may
+      // also fetch it — contact-chat receivers and forward recipients
+      // are not the uploader's family, so the owner rule alone 403'd
+      // media they legitimately hold in their own history.
+      if (!allowed) allowed = mediaPartyAllowed(rec, parent, child);
       if (!allowed) return json(res, 403, { error: 'forbidden' });
-      let bytes;
-      try { bytes = fs.readFileSync(path.join(MEDIA_DIR, rec.id)); }
-      catch { return json(res, 404, { error: 'media file missing' }); }
+      const got = await mediaStore.get(rec.id).catch(() => null);
+      if (!got) return json(res, 404, { error: 'media file missing' });
+      const bytes = got.buf;
       res.writeHead(200, { 'Content-Type': rec.contentType, 'Content-Length': bytes.length });
       return res.end(bytes);
     }
@@ -2066,6 +2200,106 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // ---- chat forward (step 3.5): copy one of MY OWN chats' media
+    //      messages into another chat I party, reusing the same
+    //      mediaId — no byte copy; the stored object simply gains a
+    //      referencing message, and delete-for-everyone removes the
+    //      bytes only when the LAST reference goes (see the DELETE
+    //      handler's refcount). Authorization mirrors chat_send's
+    //      addressing: the source message must sit in a chat the
+    //      sender parties, and so must the target — a parent names
+    //      childId, a child names toChildId for a contact chat or
+    //      nothing for its own parent pair. The new message carries
+    //      the source's kind/body/mediaId under a fresh id; relay and
+    //      wake nudges mirror chat_send exactly.
+    if (m.type === 'chat_forward') {
+      const srcId = String(m.msgId || '');
+      let src = null;
+      if (ws.role === 'parent') {
+        for (const [key, arr] of Object.entries(data.chats)) {
+          if (!key.startsWith(ws.parentId + ':') || !Array.isArray(arr)) continue;
+          const hitMsg = arr.find(x => x.id === srcId);
+          if (hitMsg) { src = hitMsg; break; }
+        }
+      } else if (ws.role === 'child') {
+        const myKeys = [];
+        if (ws.parentId) myKeys.push(chatKey(ws.parentId, ws.childId));
+        const me = data.children.find(c => c.id === ws.childId);
+        if (me) for (const cid of contactsOf(me)) myKeys.push(contactKey(ws.childId, cid));
+        for (const key of myKeys) {
+          const arr = data.chats[key];
+          if (!Array.isArray(arr)) continue;
+          const hitMsg = arr.find(x => x.id === srcId);
+          if (hitMsg) { src = hitMsg; break; }
+        }
+      } else return;
+      if (!src) return sendWs(ws, { type: 'chat_error', reason: 'not_found' });
+      const kind = src.kind;
+      const mediaId = src.mediaId ? String(src.mediaId) : null;
+      if ((kind !== 'photo' && kind !== 'file') || !mediaId || !data.media[mediaId]) {
+        return sendWs(ws, { type: 'chat_error', reason: 'bad_media' });
+      }
+      const fwdBody = src.body == null ? '' : String(src.body).slice(0, 4000);
+      const fwdTs = new Date().toISOString();
+      // Contact target (a child sender naming a contact peer).
+      if (ws.role === 'child' && m.toChildId) {
+        const peer = data.children.find(c => c.id === String(m.toChildId));
+        if (!peer || !areContacts(ws.childId, peer.id)) {
+          return sendWs(ws, { type: 'chat_error', reason: 'forbidden' });
+        }
+        const key = contactKey(ws.childId, peer.id);
+        const arr = data.chats[key] || (data.chats[key] = []);
+        const msg = {
+          id: crypto.randomBytes(8).toString('hex'),
+          contact: true, fromId: ws.childId, toId: peer.id,
+          parentId: null, childId: peer.id, fromRole: 'child', kind,
+          body: fwdBody, mediaId, ts: fwdTs,
+          replyTo: null, replySnippet: null,
+          deletedFor: [], readBy: [],
+        };
+        arr.push(msg);
+        if (arr.length > CHAT_CAP) data.chats[key] = arr.slice(-CHAT_CAP);
+        save();
+        sendWs(liveChildren.get(peer.id), Object.assign({ type: 'chat_msg' }, chatViewC(msg)));
+        maybeWakeChild(peer, 'chat');
+        return;
+      }
+      // Parent-pair target: a parent names the child; a child reaches
+      // its own parent pair by naming nothing.
+      let parentId, childId;
+      if (ws.role === 'parent') {
+        childId = String(m.childId || '');
+        const child = data.children.find(c => c.id === childId);
+        if (!child || child.parentId !== ws.parentId) return sendWs(ws, { type: 'chat_error', reason: 'forbidden' });
+        parentId = ws.parentId;
+      } else if (ws.role === 'child') {
+        if (!ws.parentId) return sendWs(ws, { type: 'chat_error', reason: 'forbidden' });
+        parentId = ws.parentId; childId = ws.childId;
+      } else return;
+      const key = chatKey(parentId, childId);
+      const arr = data.chats[key] || (data.chats[key] = []);
+      const msg = {
+        id: crypto.randomBytes(8).toString('hex'),
+        parentId, childId, fromRole: ws.role, kind,
+        body: fwdBody, mediaId, ts: fwdTs,
+        replyTo: null, replySnippet: null,
+        deletedFor: [], readBy: [],
+      };
+      arr.push(msg);
+      if (arr.length > CHAT_CAP) data.chats[key] = arr.slice(-CHAT_CAP);
+      save();
+      const out = Object.assign({ type: 'chat_msg' }, chatView(msg));
+      if (ws.role === 'parent') {
+        sendWs(liveChildren.get(childId), out);
+        maybeWakeChild(data.children.find(c => c.id === childId), 'chat');
+      } else {
+        const set = liveParents.get(parentId);
+        if (set) for (const pws of set) sendWs(pws, out);
+        maybeWakeParent(data.parents.find(p => p.id === parentId), 'chat');
+      }
+      return;
+    }
+
     // ---- typing indicator (v2.3): ephemeral relay to the other party only.
     //      Never stored, never appears in history.
     if (m.type === 'typing') {
@@ -2191,6 +2425,7 @@ wss.on('connection', (ws, req) => {
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
 if (require.main === module) {
   console.log(`[storage] mode=${STORAGE_MODE}${STORAGE_MODE === 'firestore' ? ` doc=${STORAGE_COLLECTION}/${STORAGE_DOC_ID}` : ''}`);
+  console.log(`[media] backend=${MEDIA_BACKEND}${MEDIA_BACKEND === 'firestore' ? ' (firestore-chunks)' : ` dir=${MEDIA_DIR}`}`);
   if (STORAGE_MODE === 'firestore') {
     // Hydrate BEFORE listening so no request can mutate (or be
     // clobbered by) the pre-hydration state.
@@ -2207,4 +2442,4 @@ module.exports = { injectInviteToken, parseInjectedToken };
 // Test-only handle (scripts/step3-test.js): lets hermetic tests drive
 // the wake path against a stubbed fetch and inspect the wake log and
 // stored records. Not used by any wire path.
-module.exports._test = { data, wakeLog, attemptWake, wakePendings, parentWakePendings, STORAGE_MODE, storageStats, normalizeNumber };
+module.exports._test = { data, wakeLog, attemptWake, wakePendings, parentWakePendings, STORAGE_MODE, storageStats, normalizeNumber, canonicalizeNumber, MEDIA_BACKEND, mediaStore };

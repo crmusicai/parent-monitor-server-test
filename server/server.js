@@ -61,30 +61,231 @@ const WS_PING_MS = parseInt(process.env.WS_PING_MS || '30000', 10);
 function blankData() {
   return { parents: [], tokens: {}, pairingCodes: {}, children: [], invites: {}, chats: {}, media: {}, numbers: {} };
 }
+function normalizeData(d) {
+  if (!d || typeof d !== 'object') return blankData();
+  return {
+    parents: Array.isArray(d.parents) ? d.parents : [],
+    tokens: d.tokens && typeof d.tokens === 'object' ? d.tokens : {},
+    pairingCodes: d.pairingCodes && typeof d.pairingCodes === 'object' ? d.pairingCodes : {},
+    children: Array.isArray(d.children) ? d.children : [],
+    invites: d.invites && typeof d.invites === 'object' ? d.invites : {},
+    chats: d.chats && typeof d.chats === 'object' ? d.chats : {},
+    media: d.media && typeof d.media === 'object' ? d.media : {},
+    // Number accounts (number system): normalized phone number ->
+    // { childId, salt, passwordHash, deviceName, createdAt }. Older
+    // data files simply have no such key yet.
+    numbers: d.numbers && typeof d.numbers === 'object' ? d.numbers : {},
+  };
+}
 function loadData() {
   try {
-    const d = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    if (!d || typeof d !== 'object') return blankData();
-    return {
-      parents: Array.isArray(d.parents) ? d.parents : [],
-      tokens: d.tokens && typeof d.tokens === 'object' ? d.tokens : {},
-      pairingCodes: d.pairingCodes && typeof d.pairingCodes === 'object' ? d.pairingCodes : {},
-      children: Array.isArray(d.children) ? d.children : [],
-      invites: d.invites && typeof d.invites === 'object' ? d.invites : {},
-      chats: d.chats && typeof d.chats === 'object' ? d.chats : {},
-      media: d.media && typeof d.media === 'object' ? d.media : {},
-      // Number accounts (number system): normalized phone number ->
-      // { childId, salt, passwordHash, deviceName, createdAt }. Older
-      // data files simply have no such key yet.
-      numbers: d.numbers && typeof d.numbers === 'object' ? d.numbers : {},
-    };
+    return normalizeData(JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')));
   } catch { return blankData(); }
 }
 const data = loadData();
-function save() {
+// Replace the live state's contents in place (same object identity —
+// module.exports._test.data and every handler hold this reference).
+function replaceData(parsed) {
+  const nd = normalizeData(parsed);
+  data.parents = nd.parents;
+  data.tokens = nd.tokens;
+  data.pairingCodes = nd.pairingCodes;
+  data.children = nd.children;
+  data.invites = nd.invites;
+  data.chats = nd.chats;
+  data.media = nd.media;
+  data.numbers = nd.numbers;
+}
+function isDataEmpty(d) {
+  return d.parents.length === 0 && d.children.length === 0
+    && Object.keys(d.tokens).length === 0 && Object.keys(d.pairingCodes).length === 0
+    && Object.keys(d.invites).length === 0 && Object.keys(d.chats).length === 0
+    && Object.keys(d.media).length === 0 && Object.keys(d.numbers).length === 0;
+}
+function saveLocalOnly() {
   const tmp = DATA_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
   fs.renameSync(tmp, DATA_FILE); // atomic replace
+}
+function save() {
+  saveLocalOnly(); // warm local cache, exactly as before
+  if (STORAGE_MODE === 'firestore') scheduleFirestorePersist();
+  else { storageStats.lastPersistOk = true; storageStats.lastPersistAt = new Date().toISOString(); }
+}
+
+// ------------------------------------------------- persistent storage
+// The local data.json lives on the host's EPHEMERAL disk (Render free
+// tier): any restart/recycle/redeploy wipes it, and with it every
+// parent account, pairing and number registration — the field failure
+// behind the 2026-11-04/05 "suddenly logged out / number not
+// registered" reports. The durable copy therefore lives in Firestore
+// (same Firebase project as FCM), written through the REST API with
+// the SAME service account and the SAME hand-rolled JWT -> OAuth2
+// mechanism fcm.js uses for messaging (datastore scope; zero new
+// dependencies). The whole state is one document —
+// familyCallServer/<STORAGE_DOC_ID> — with a single string field
+// holding the JSON. Boot hydrates from it before listening; save()
+// still writes the local file synchronously and schedules a debounced
+// Firestore write. STORAGE_MODE=file is the pure-local rollback path
+// (and the automatic mode when no service account is configured, e.g.
+// the hermetic test suites). A failed Firestore write never blocks or
+// crashes request handling: it is logged, counted, and retried by the
+// next save.
+const STORAGE_COLLECTION = 'familyCallServer';
+const STORAGE_DOC_ID = process.env.STORAGE_DOC_ID || 'test'; // doc id on this (test) track
+const STORAGE_SIZE_WARN_BYTES = 900 * 1024; // Firestore docs cap at ~1 MiB; warn, never chunk (this round)
+const DATASTORE_SCOPE = 'https://www.googleapis.com/auth/datastore';
+const TOKEN_URL = 'https://oauth2.googleapis.com/token'; // same endpoint fcm.js uses
+const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000; // refresh 5 min early, as in fcm.js
+const storageSA = (() => {
+  try {
+    const parsed = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '');
+    return fcm.validServiceAccount(parsed) ? parsed : null;
+  } catch { return null; }
+})();
+const STORAGE_MODE = (() => {
+  const req = String(process.env.STORAGE_MODE || '').toLowerCase();
+  if (req === 'file') return 'file';
+  if (storageSA) return 'firestore';
+  if (req === 'firestore') console.warn('[storage] STORAGE_MODE=firestore requested but FIREBASE_SERVICE_ACCOUNT is missing/invalid — falling back to file mode');
+  return 'file';
+})();
+const storageStats = { lastPersistOk: null, lastPersistAt: null, persistErrors: 0 };
+let fsTokenCache = null; // { token, expiresAtMs } — mirrors fcm.js's sender cache
+async function getDatastoreToken() {
+  const now = Date.now();
+  if (fsTokenCache && now < fsTokenCache.expiresAtMs - TOKEN_REFRESH_SKEW_MS) return fsTokenCache.token;
+  const jwt = fcm.buildJwt(storageSA, Math.floor(now / 1000), DATASTORE_SCOPE);
+  const body = new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    assertion: jwt,
+  });
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  if (!res || !res.ok) return null;
+  const j = await res.json().catch(() => null);
+  if (!j || typeof j.access_token !== 'string') return null;
+  const ttlMs = (typeof j.expires_in === 'number' ? j.expires_in : 3600) * 1000;
+  fsTokenCache = { token: j.access_token, expiresAtMs: now + ttlMs };
+  return fsTokenCache.token;
+}
+function firestoreDocUrl() {
+  return `https://firestore.googleapis.com/v1/projects/${storageSA.project_id}/databases/(default)/documents/${STORAGE_COLLECTION}/${encodeURIComponent(STORAGE_DOC_ID)}`;
+}
+// Returns the stored JSON string, null when the doc does not exist;
+// throws on any other failure (caller decides retry policy).
+async function firestoreFetchDoc() {
+  const token = await getDatastoreToken();
+  if (!token) throw new Error('oauth_failed');
+  const res = await fetch(firestoreDocUrl(), { headers: { Authorization: `Bearer ${token}` } });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error('firestore_get_http_' + res.status);
+  const doc = await res.json().catch(() => null);
+  const v = doc && doc.fields && doc.fields.state && doc.fields.state.stringValue;
+  if (typeof v !== 'string') throw new Error('firestore_doc_malformed');
+  return v;
+}
+async function firestoreWriteDoc(jsonStr) {
+  const token = await getDatastoreToken();
+  if (!token) throw new Error('oauth_failed');
+  const url = firestoreDocUrl() + '?updateMask.fieldPaths=state&updateMask.fieldPaths=updatedAt';
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fields: {
+        state: { stringValue: jsonStr },
+        updatedAt: { timestampValue: new Date().toISOString() },
+      },
+    }),
+  });
+  if (!res.ok) throw new Error('firestore_patch_http_' + res.status);
+}
+let persistTimer = null;
+let persistInFlight = false;
+let persistDirty = false;
+let bootHydrateFailed = false; // boot fetch errored (vs doc-missing): first write re-checks the remote
+let bootGuardDone = false;
+let sizeWarnedAt = 0;
+function scheduleFirestorePersist() {
+  if (STORAGE_MODE !== 'firestore' || persistTimer) return; // a pending write serializes the latest state anyway
+  persistTimer = setTimeout(() => { persistTimer = null; runFirestorePersist(); }, 1000);
+  if (persistTimer.unref) persistTimer.unref();
+}
+async function runFirestorePersist() {
+  if (persistInFlight) { persistDirty = true; return; }
+  persistInFlight = true;
+  try {
+    if (bootHydrateFailed && !bootGuardDone) {
+      // Boot could not read the remote (transient network), and this
+      // process may be holding an empty local state recycled from a
+      // wiped disk. Before the first write, look once more: if the
+      // remote holds real data and local is empty, hydrate instead of
+      // clobbering the only durable copy.
+      bootGuardDone = true;
+      try {
+        const remote = await firestoreFetchDoc();
+        if (remote != null && isDataEmpty(data) && !isDataEmpty(normalizeData(JSON.parse(remote)))) {
+          replaceData(JSON.parse(remote));
+          saveLocalOnly();
+          console.warn('[storage] boot hydration had failed; recovered state from Firestore at first persist — overwrite skipped');
+          return;
+        }
+      } catch {}
+    }
+    const jsonStr = JSON.stringify(data);
+    const bytes = Buffer.byteLength(jsonStr);
+    if (bytes > STORAGE_SIZE_WARN_BYTES && Date.now() - sizeWarnedAt > 10 * 60 * 1000) {
+      sizeWarnedAt = Date.now();
+      console.warn(`[storage] WARNING: serialized state is ${bytes} bytes, over the ${STORAGE_SIZE_WARN_BYTES}-byte watch level (Firestore document limit ~1 MiB). Chunking is NOT implemented in this round.`);
+    }
+    await firestoreWriteDoc(jsonStr);
+    storageStats.lastPersistOk = true;
+    storageStats.lastPersistAt = new Date().toISOString();
+  } catch (e) {
+    storageStats.lastPersistOk = false;
+    storageStats.persistErrors++;
+    console.warn('[storage] firestore persist failed:', (e && e.message) || e);
+  } finally {
+    persistInFlight = false;
+    if (persistDirty) {
+      persistDirty = false;
+      const t = setTimeout(runFirestorePersist, 250);
+      if (t.unref) t.unref();
+    }
+  }
+}
+// Boot-time hydration (main module only): Firestore first, with a few
+// retries while the network warms. A missing doc means "authoritative
+// empty" — start from local and push it up on the first save. Any
+// other failure after retries leaves the local state in charge and
+// arms the first-write guard above.
+async function hydrateFromFirestore() {
+  const delays = [500, 1000, 2000, 4000, 8000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const remote = await firestoreFetchDoc();
+      if (remote == null) {
+        console.log('[storage] no Firestore state doc yet — starting from local data');
+        scheduleFirestorePersist(); // push the local state up promptly
+        return;
+      }
+      replaceData(JSON.parse(remote));
+      saveLocalOnly(); // warm cache mirrors the durable copy
+      console.log('[storage] state hydrated from Firestore');
+      return;
+    } catch (e) {
+      if (attempt >= delays.length) {
+        bootHydrateFailed = true;
+        console.warn('[storage] Firestore hydration failed after retries — continuing with local data:', (e && e.message) || e);
+        return;
+      }
+      await new Promise(r => setTimeout(r, delays[attempt]));
+    }
+  }
 }
 
 // ---------------------------------------------------------------- live state
@@ -500,7 +701,18 @@ function childBusyAny(childId) {
 // ---------------------------------------------------------------------------
 function normalizeNumber(raw) {
   const s = String(raw == null ? '' : raw).replace(/[\s\-()]/g, '');
-  return /^\+?\d{6,15}$/.test(s) ? s : null;
+  if (!/^\+?\d{6,15}$/.test(s)) return null;
+  // Bangladeshi equivalence (owner audit 2026-11-05, decision #3):
+  // the same mobile number written in local (01...), bare-country
+  // (8801...) or international (+8801...) form is ONE address. The
+  // canonical stored form is +880...; every entry point (register,
+  // login, add-by-number, add-contact) funnels through here, so
+  // duplicates across forms collide and lookups match across forms.
+  if (s[0] !== '+') {
+    if (/^8801\d{9}$/.test(s)) return '+' + s;
+    if (/^01\d{9}$/.test(s)) return '+880' + s.slice(1);
+  }
+  return s;
 }
 function contactsOf(child) {
   if (!Array.isArray(child.contacts)) child.contacts = [];
@@ -774,6 +986,14 @@ const server = http.createServer(async (req, res) => {
         contactPairs: Math.floor(
           data.children.reduce((n, c) => n + (Array.isArray(c.contacts) ? c.contacts.length : 0), 0) / 2
         ),
+        // Persistent storage (additive): which mode the durable copy
+        // uses and whether the last Firestore persist landed.
+        storage: {
+          mode: STORAGE_MODE,
+          lastPersistOk: storageStats.lastPersistOk,
+          lastPersistAt: storageStats.lastPersistAt,
+          persistErrors: storageStats.persistErrors,
+        },
       });
     }
 
@@ -1970,7 +2190,16 @@ wss.on('connection', (ws, req) => {
 
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
 if (require.main === module) {
-  server.listen(PORT, () => console.log(`parent-monitor server on :${PORT} (data: ${DATA_FILE})`));
+  console.log(`[storage] mode=${STORAGE_MODE}${STORAGE_MODE === 'firestore' ? ` doc=${STORAGE_COLLECTION}/${STORAGE_DOC_ID}` : ''}`);
+  if (STORAGE_MODE === 'firestore') {
+    // Hydrate BEFORE listening so no request can mutate (or be
+    // clobbered by) the pre-hydration state.
+    hydrateFromFirestore()
+      .catch(() => {})
+      .finally(() => server.listen(PORT, () => console.log(`parent-monitor server on :${PORT} (data: ${DATA_FILE})`)));
+  } else {
+    server.listen(PORT, () => console.log(`parent-monitor server on :${PORT} (data: ${DATA_FILE})`));
+  }
 }
 
 // Exported for tests (scripts/v2_1-test.js); running `node server.js` is unaffected.
@@ -1978,4 +2207,4 @@ module.exports = { injectInviteToken, parseInjectedToken };
 // Test-only handle (scripts/step3-test.js): lets hermetic tests drive
 // the wake path against a stubbed fetch and inspect the wake log and
 // stored records. Not used by any wire path.
-module.exports._test = { data, wakeLog, attemptWake, wakePendings, parentWakePendings };
+module.exports._test = { data, wakeLog, attemptWake, wakePendings, parentWakePendings, STORAGE_MODE, storageStats, normalizeNumber };

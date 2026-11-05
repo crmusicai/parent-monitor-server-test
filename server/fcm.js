@@ -60,13 +60,15 @@ function base64url(input) {
 
 /**
  * Pure: build (and sign) the OAuth2 JWT bearer assertion for a service
- * account. `nowSeconds` is injected for deterministic tests.
+ * account. `nowSeconds` is injected for deterministic tests. `scope`
+ * defaults to the FCM messaging scope; the server's Firestore storage
+ * layer passes the datastore scope to reuse this exact signing path.
  */
-function buildJwt(sa, nowSeconds) {
+function buildJwt(sa, nowSeconds, scope) {
   const header = { alg: 'RS256', typ: 'JWT' };
   const claims = {
     iss: sa.client_email,
-    scope: FCM_SCOPE,
+    scope: scope || FCM_SCOPE,
     aud: TOKEN_URL,
     iat: nowSeconds,
     exp: nowSeconds + TOKEN_EXPIRY_S,

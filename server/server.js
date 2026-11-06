@@ -492,6 +492,82 @@ function clearWakePendingsForParentWs(ws) {
     if (p.parentWs === ws) dropWakePending(key);
   }
 }
+
+// ---- Data sections (feature 2026-11-06): a bound parent views the
+// child's Contacts / Call list / SMS / Gallery, fetched LIVE from the
+// phone. Pure relay, exactly like the location forward: the server
+// validates the control binding, wakes an offline child and holds the
+// request (same wake-and-wait shape as calls), forwards the request,
+// routes the response back, and stores NOTHING — lists and photos pass
+// through and are gone. Access rule is the listen/camera rule: only the
+// child's bound parent (child.parentId) may ask.
+const DATA_SECTIONS = new Set(['contacts', 'calls', 'sms', 'gallery', 'photo']);
+const DATA_WAIT_MS = WAKE_WAIT_MS;
+const DATA_INFLIGHT_MS = 120000;
+const dataPendings = new Map();  // reqId -> request held while the child is woken
+const dataInflight = new Map();  // reqId -> request forwarded, awaiting the child's response
+
+function sendDataError(parentWs, reqId, childId, section, reason) {
+  sendWs(parentWs, { type: 'data_error', reqId, childId, section, reason });
+}
+
+function forwardDataRequest(cws, p) {
+  const inflight = { parentWs: p.parentWs, parentId: p.parentId, childId: p.childId, section: p.section, timer: null };
+  inflight.timer = setTimeout(() => {
+    if (dataInflight.get(p.reqId) !== inflight) return;
+    dataInflight.delete(p.reqId);
+    sendDataError(inflight.parentWs, p.reqId, inflight.childId, inflight.section, 'timeout');
+  }, DATA_INFLIGHT_MS);
+  if (inflight.timer.unref) inflight.timer.unref();
+  dataInflight.set(p.reqId, inflight);
+  const msg = { type: 'data_request', reqId: p.reqId, section: p.section, page: p.page };
+  if (p.photoId) msg.photoId = p.photoId;
+  sendWs(cws, msg);
+}
+
+function pendDataRequest(parentWs, req) {
+  dropDataPending(req.reqId);
+  const p = { ...req, parentWs, parentId: parentWs.parentId, createdAt: Date.now(), timer: null };
+  p.timer = setTimeout(() => {
+    if (dataPendings.get(req.reqId) !== p) return;
+    dataPendings.delete(req.reqId);
+    sendDataError(p.parentWs, req.reqId, p.childId, p.section, 'offline');
+  }, DATA_WAIT_MS);
+  if (p.timer.unref) p.timer.unref();
+  dataPendings.set(req.reqId, p);
+  sendWs(parentWs, { type: 'data_pending', reqId: req.reqId, childId: req.childId, section: req.section });
+}
+
+function dropDataPending(reqId) {
+  const p = dataPendings.get(reqId);
+  if (p) { clearTimeout(p.timer); dataPendings.delete(reqId); }
+}
+
+// Execute held data requests for a child whose socket just registered
+// (called beside flushWakePendings). Re-validates the binding first.
+function flushDataPendings(child) {
+  const cws = liveChildren.get(child.id);
+  if (!cws || cws.readyState !== 1) return;
+  for (const [reqId, p] of [...dataPendings.entries()]) {
+    if (p.childId !== child.id) continue;
+    dataPendings.delete(reqId);
+    clearTimeout(p.timer);
+    if (!p.parentWs || p.parentWs.readyState !== 1) continue;
+    const fresh = data.children.find(c => c.id === p.childId);
+    if (!fresh || fresh.parentId !== p.parentId) continue;
+    forwardDataRequest(cws, p);
+  }
+}
+
+// Parent socket went away: its data requests die with it, silently.
+function clearDataForParentWs(ws) {
+  for (const [reqId, p] of [...dataPendings.entries()]) {
+    if (p.parentWs === ws) dropDataPending(reqId);
+  }
+  for (const [reqId, f] of [...dataInflight.entries()]) {
+    if (f.parentWs === ws) { clearTimeout(f.timer); dataInflight.delete(reqId); }
+  }
+}
 // Hold a child-initiated call for an offline parent (the mirror image
 // of pendWakeRequest). One pending per child — a child can only be
 // placing one outgoing call. The child hears nothing while waiting;
@@ -766,7 +842,14 @@ function normalizeNumberLegacy(raw) {
 // ---------------------------------------------------------------------------
 const COUNTRY_DIALS = (() => {
   try {
-    const list = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'shared', 'countries.json'), 'utf8'));
+    const candidates = [
+      path.join(__dirname, 'countries.json'),
+      path.join(__dirname, '..', 'shared', 'countries.json'),
+      path.join(__dirname, 'shared', 'countries.json'),
+    ];
+    const file = candidates.find((p) => fs.existsSync(p));
+    if (!file) throw new Error('countries.json not found in any candidate location');
+    const list = JSON.parse(fs.readFileSync(file, 'utf8'));
     const set = new Set();
     for (const c of list) { const d = String(c && c.dial || ''); if (/^\d{1,4}$/.test(d)) set.add(d); }
     // Longest first, so e.g. "1242" (Bahamas) wins over "1" (NANP).
@@ -1838,6 +1921,7 @@ wss.on('connection', (ws, req) => {
     sendWs(ws, { type: 'connected', role: 'child', childId: child.id, parentId: child.parentId });
     // Wake-and-wait: execute any parent requests held for this child.
     flushWakePendings(child);
+    flushDataPendings(child);
   } else {
     sendWs(ws, { type: 'error', error: 'bad role' });
     try { ws.close(4400); } catch {}
@@ -2394,11 +2478,60 @@ wss.on('connection', (ws, req) => {
       if (set) for (const pws of set) sendWs(pws, msg);
       return;
     }
+
+    // ---- data sections (feature 2026-11-06): bound parent asks the
+    // child for Contacts / Call list / SMS / Gallery data. Same binding
+    // rule as listen_start; an offline child is woken and the request is
+    // held (data_pending), an online child gets it at once.
+    if (m.type === 'data_request' && ws.role === 'parent') {
+      const reqId = String(m.reqId || '');
+      const childId = String(m.childId || '');
+      const section = String(m.section || '');
+      if (!reqId || !DATA_SECTIONS.has(section)) return sendDataError(ws, reqId, childId, section, 'bad_request');
+      const child = data.children.find(c => c.id === childId);
+      if (!child) return sendDataError(ws, reqId, childId, section, 'not_found');
+      if (child.parentId !== ws.parentId) return sendDataError(ws, reqId, childId, section, 'forbidden');
+      const page = Math.max(0, parseInt(m.page || '0', 10) || 0);
+      const photoId = section === 'photo' ? String(m.photoId || '') : undefined;
+      if (section === 'photo' && !photoId) return sendDataError(ws, reqId, childId, section, 'bad_request');
+      const cws = liveChildren.get(childId);
+      if (!cws || cws.readyState !== 1) {
+        attemptWake('child', child, 'data');
+        pendDataRequest(ws, { reqId, childId, section, page, photoId });
+        return;
+      }
+      forwardDataRequest(cws, { reqId, childId, section, page, photoId, parentWs: ws, parentId: ws.parentId });
+      return;
+    }
+
+    // ---- data sections: the child's response, routed to the parent who
+    // asked (and only that parent). List responses are single-shot;
+    // photo responses stream chunks with done:false until the last one.
+    if (m.type === 'data_response' && ws.role === 'child') {
+      const reqId = String(m.reqId || '');
+      const f = dataInflight.get(reqId);
+      if (!f || f.childId !== ws.childId) return;
+      if (m.done !== false) { clearTimeout(f.timer); dataInflight.delete(reqId); }
+      if (f.parentWs && f.parentWs.readyState === 1) {
+        const out = { type: 'data_response', reqId, childId: f.childId, section: f.section };
+        if (Array.isArray(m.items)) out.items = m.items;
+        if (typeof m.hasMore === 'boolean') out.hasMore = m.hasMore;
+        if (m.error) out.error = String(m.error);
+        if (m.chunk !== undefined) out.chunk = m.chunk;
+        if (m.totalChunks !== undefined) out.totalChunks = m.totalChunks;
+        if (typeof m.data === 'string') out.data = m.data;
+        if (m.name) out.name = String(m.name);
+        if (m.mime) out.mime = String(m.mime);
+        sendWs(f.parentWs, out);
+      }
+      return;
+    }
   });
 
   ws.on('close', () => {
     if (ws.role === 'parent') {
       clearWakePendingsForParentWs(ws); // held wake requests die silently
+      clearDataForParentWs(ws); // held data requests die silently too
       const set = liveParents.get(ws.parentId);
       if (set) { set.delete(ws); if (!set.size) liveParents.delete(ws.parentId); }
       for (const s of [...sessions.values()]) {
@@ -2442,4 +2575,4 @@ module.exports = { injectInviteToken, parseInjectedToken };
 // Test-only handle (scripts/step3-test.js): lets hermetic tests drive
 // the wake path against a stubbed fetch and inspect the wake log and
 // stored records. Not used by any wire path.
-module.exports._test = { data, wakeLog, attemptWake, wakePendings, parentWakePendings, STORAGE_MODE, storageStats, normalizeNumber, canonicalizeNumber, MEDIA_BACKEND, mediaStore };
+module.exports._test = { data, wakeLog, attemptWake, wakePendings, parentWakePendings, dataPendings, dataInflight, STORAGE_MODE, storageStats, normalizeNumber, canonicalizeNumber, MEDIA_BACKEND, mediaStore };

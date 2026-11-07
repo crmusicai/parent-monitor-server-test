@@ -404,13 +404,24 @@ function pruneDeadToken(rec, tokenSent) {
 // Fire one wake push at a child/parent record. Always returns the log
 // entry (fcm: 'no_token' when there is nothing to send to); the entry's
 // fcm/errorCode fields are updated when the send resolves. Never throws.
-function attemptWake(role, rec, reason) {
+// opts.repush marks a continuation push of an already-held wake-and-wait
+// (see armRepushes); opts.bypassThrottle gives it a one-off throttle key
+// so the wake service never suppresses it — a re-push exists precisely
+// because the first push did not bring the target back.
+// Throttle keying (fix 2026-11-07): per (target, reason), not per target
+// — field evidence 12:20 +06: a Call wake was 'throttled' seconds after
+// unrelated Listen/Data wakes, so a genuinely different action never
+// reached the phone. Same-reason repeats still throttle against each
+// other inside the wake service's window.
+function attemptWake(role, rec, reason, opts) {
   if (!rec) return null;
   if (!rec.fcmToken) return recordWake(role, rec.id, reason, 'no_token');
   const entry = recordWake(role, rec.id, reason, 'sent');
+  if (opts && opts.repush) entry.repush = true;
   wakeAttempts++;
   const token = rec.fcmToken;
-  const key = role === 'parent' ? 'parent:' + rec.id : rec.id;
+  let key = (role === 'parent' ? 'parent:' + rec.id : rec.id) + '|' + reason;
+  if (opts && opts.bypassThrottle) key += '|x' + Date.now();
   wakeService.wakeDetailed(key, token, { reason }).then(r => {
     if (r.throttled) entry.fcm = 'throttled';
     else if (r.dead) { entry.fcm = 'dead'; entry.errorCode = r.errorCode; pruneDeadToken(rec, token); }
@@ -446,10 +457,34 @@ function sendStartFailure(parentWs, kind, childId, reason) {
   return sendWs(parentWs, { type: kind + '_error', childId, reason });
 }
 function pendingKey(parentId, childId, kind) { return `${parentId}|${childId}|${kind}`; }
+// Re-push schedule inside one wake-and-wait window (fix 2026-11-07):
+// field evidence (Infinix X6880, 12:19 +06) — the first push delivered
+// ('ok') but the phone's system ate the app's background start (an
+// FGS-start-timeout crash is on record for the device), so nobody was
+// home when the server knocked once. Extra pushes at 30% and 70% of the
+// wait give the phone's revival paths (accessibility anchor, job,
+// watchdog alarm) more than one doorbell inside the SAME wait — the
+// parent-visible WAKE_WAIT_MS is unchanged. fire() re-validates that
+// its pending is still the registered one and the target still has no
+// live socket; every drop/flush/timeout path clears the timers.
+const REPUSH_AT_MS = [Math.floor(WAKE_WAIT_MS * 0.3), Math.floor(WAKE_WAIT_MS * 0.7)];
+function armRepushes(p, fire) {
+  p.repushTimers = REPUSH_AT_MS.map(ms => {
+    const t = setTimeout(() => { try { fire(); } catch {} }, ms);
+    if (t.unref) t.unref();
+    return t;
+  });
+}
+function clearRepushes(p) {
+  if (p && p.repushTimers) {
+    for (const t of p.repushTimers) clearTimeout(t);
+    p.repushTimers = [];
+  }
+}
 function dropWakePending(key) {
   const p = wakePendings.get(key);
   if (p) {
-    clearTimeout(p.timer); wakePendings.delete(key);
+    clearTimeout(p.timer); clearRepushes(p); wakePendings.delete(key);
     if (p.logEntry && p.logEntry.wait === 'waiting') p.logEntry.wait = 'cancelled';
   }
   return p || null;
@@ -472,10 +507,17 @@ function pendWakeRequest(parentWs, child, kind, extra) {
   p.timer = setTimeout(() => {
     if (wakePendings.get(key) !== p) return; // replaced or flushed
     wakePendings.delete(key);
+    clearRepushes(p);
     if (p.logEntry) p.logEntry.wait = 'timeout';
     sendStartFailure(p.parentWs, kind, p.childId, 'offline');
   }, WAKE_WAIT_MS);
   if (p.timer.unref) p.timer.unref();
+  armRepushes(p, () => {
+    if (wakePendings.get(key) !== p) return; // replaced, flushed or timed out
+    if (childSocketOpen(p.childId)) return;
+    const rec = data.children.find(c => c.id === p.childId);
+    attemptWake('child', rec, kind, { repush: true, bypassThrottle: true });
+  });
   wakePendings.set(key, p);
   sendWs(parentWs, { type: 'wake_pending', kind, childId: child.id });
 }
@@ -490,6 +532,7 @@ function flushWakePendings(child) {
     if (p.childId !== child.id) continue;
     wakePendings.delete(key);
     clearTimeout(p.timer);
+    clearRepushes(p);
     if (p.logEntry) p.logEntry.wait = 'connected';
     if (!p.parentWs || p.parentWs.readyState !== 1) continue;
     const fresh = data.children.find(c => c.id === p.childId);
@@ -551,16 +594,23 @@ function pendDataRequest(parentWs, req) {
   p.timer = setTimeout(() => {
     if (dataPendings.get(req.reqId) !== p) return;
     dataPendings.delete(req.reqId);
+    clearRepushes(p);
     sendDataError(p.parentWs, req.reqId, p.childId, p.section, 'offline');
   }, DATA_WAIT_MS);
   if (p.timer.unref) p.timer.unref();
+  armRepushes(p, () => {
+    if (dataPendings.get(req.reqId) !== p) return;
+    if (childSocketOpen(p.childId)) return;
+    const rec = data.children.find(c => c.id === p.childId);
+    attemptWake('child', rec, 'data', { repush: true, bypassThrottle: true });
+  });
   dataPendings.set(req.reqId, p);
   sendWs(parentWs, { type: 'data_pending', reqId: req.reqId, childId: req.childId, section: req.section });
 }
 
 function dropDataPending(reqId) {
   const p = dataPendings.get(reqId);
-  if (p) { clearTimeout(p.timer); dataPendings.delete(reqId); }
+  if (p) { clearTimeout(p.timer); clearRepushes(p); dataPendings.delete(reqId); }
 }
 
 // Execute held data requests for a child whose socket just registered
@@ -572,6 +622,7 @@ function flushDataPendings(child) {
     if (p.childId !== child.id) continue;
     dataPendings.delete(reqId);
     clearTimeout(p.timer);
+    clearRepushes(p);
     if (!p.parentWs || p.parentWs.readyState !== 1) continue;
     const fresh = data.children.find(c => c.id === p.childId);
     if (!fresh || fresh.parentId !== p.parentId) continue;
@@ -603,16 +654,23 @@ function pendParentWake(childWs, child, media, logEntry) {
   p.timer = setTimeout(() => {
     if (parentWakePendings.get(child.id) !== p) return; // replaced or flushed
     parentWakePendings.delete(child.id);
+    clearRepushes(p);
     if (p.logEntry) p.logEntry.wait = 'timeout';
     sendWs(p.childWs, { type: 'call_error', reason: 'offline' });
   }, WAKE_WAIT_MS);
   if (p.timer.unref) p.timer.unref();
+  armRepushes(p, () => {
+    if (parentWakePendings.get(child.id) !== p) return;
+    if (parentSocketOpen(p.parentId)) return;
+    const rec = data.parents.find(x => x.id === p.parentId);
+    attemptWake('parent', rec, 'call', { repush: true, bypassThrottle: true });
+  });
   parentWakePendings.set(child.id, p);
 }
 function dropParentWakePending(childId, outcome) {
   const p = parentWakePendings.get(childId);
   if (p) {
-    clearTimeout(p.timer); parentWakePendings.delete(childId);
+    clearTimeout(p.timer); clearRepushes(p); parentWakePendings.delete(childId);
     if (p.logEntry && p.logEntry.wait === 'waiting') p.logEntry.wait = outcome || 'cancelled';
   }
   return p || null;
@@ -625,6 +683,7 @@ function flushParentWakePendings(parent) {
     if (p.parentId !== parent.id) continue;
     parentWakePendings.delete(key);
     clearTimeout(p.timer);
+    clearRepushes(p);
     if (p.logEntry) p.logEntry.wait = 'connected';
     const cws = liveChildren.get(p.childId);
     if (!cws || cws.readyState !== 1) continue;
@@ -1854,7 +1913,7 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
         // it can never appear now — with the standard offline shape.
         for (const [key, p] of [...wakePendings.entries()]) {
           if (p.childId === child.id) {
-            clearTimeout(p.timer); wakePendings.delete(key);
+            clearTimeout(p.timer); clearRepushes(p); wakePendings.delete(key);
             if (p.logEntry) p.logEntry.wait = 'cancelled';
             sendStartFailure(p.parentWs, p.kind, p.childId, 'offline');
           }

@@ -537,6 +537,7 @@ function flushWakePendings(child) {
     if (!p.parentWs || p.parentWs.readyState !== 1) continue;
     const fresh = data.children.find(c => c.id === p.childId);
     if (!fresh || fresh.parentId !== p.parentId) continue;
+    replaceOwnMonitoringSessions(p.parentId, p.childId);
     if (partyBusy(p.parentId, p.childId)) {
       sendStartFailure(p.parentWs, p.kind, p.childId, 'busy');
       continue;
@@ -851,6 +852,22 @@ function partyBusy(parentId, childId) {
         s.aChildId === childId || s.bChildId === childId) return true;
   }
   return false;
+}
+// Ghost replace (2026-11-07, owner report 12:48 +06): the requesting
+// parent's OWN leftover listen/camera session with this same child must
+// never block their new request — the leftover is their own abandoned
+// screen (offer never arrived, or Stop never pressed), and the new tap
+// IS the intent to replace it. Closed with reason 'replaced'. Call
+// sessions are never replaced (a ringing or live call keeps the pair
+// busy), and sessions of any other party are never touched — those
+// still report busy through partyBusy exactly as before.
+function replaceOwnMonitoringSessions(parentId, childId) {
+  for (const s of [...sessions.values()]) {
+    if (s.kind === 'call') continue;
+    if (s.parentId === parentId && s.childId === childId) {
+      closeSession(s, peerSockets(s), 'replaced');
+    }
+  }
 }
 // Is this socket one of the two parties of the session? Contact
 // sessions (number system) party on two CHILD sockets (aWs = caller,
@@ -1968,7 +1985,15 @@ if (wsPingTimer.unref) wsPingTimer.unref();
 // 2026-11-06 "Busy forever" zombie) must not hold the pair busy
 // indefinitely. Answered sessions are never touched, however long they
 // run; ringing calls already expire via RING_TIMEOUT_MS.
-const SESSION_UNANSWERED_TTL_MS = parseInt(process.env.SESSION_UNANSWERED_TTL_MS || '600000', 10);
+// TTL shortened 600000 -> 90000 the same day (owner hit "Busy — another
+// session is already active" at 12:48 +06 from a session whose child
+// never sent an offer at all): in every healthy trail the child's offer
+// arrives within seconds of the start, so 90 s is generous, and a
+// 10-minute ghost is indistinguishable from a permanent block to the
+// parent. The sweep tick derives from the TTL (tests run it fast);
+// production keeps the 30 s tick.
+const SESSION_UNANSWERED_TTL_MS = parseInt(process.env.SESSION_UNANSWERED_TTL_MS || '90000', 10);
+const SESSION_SWEEP_MS = Math.min(30000, Math.max(1000, Math.floor(SESSION_UNANSWERED_TTL_MS / 3)));
 const sessionSweepTimer = setInterval(() => {
   const now = Date.now();
   for (const s of [...sessions.values()]) {
@@ -1978,7 +2003,7 @@ const sessionSweepTimer = setInterval(() => {
       closeSession(s, peerSockets(s), 'timeout');
     }
   }
-}, 30000);
+}, SESSION_SWEEP_MS);
 if (sessionSweepTimer.unref) sessionSweepTimer.unref();
 wss.on('connection', (ws, req) => {
   // Liveness tracking for the reaper above. The ws library (and OkHttp
@@ -2060,6 +2085,7 @@ wss.on('connection', (ws, req) => {
       const child = data.children.find(c => c.id === childId);
       if (!child) return sendWs(ws, { type: 'listen_error', childId, reason: 'not_found' });
       if (child.parentId !== ws.parentId) return sendWs(ws, { type: 'listen_error', childId, reason: 'forbidden' });
+      replaceOwnMonitoringSessions(ws.parentId, childId);
       const cws = liveChildren.get(childId);
       if (!cws || cws.readyState !== 1 || reapStaleChildSocket(childId)) {
         // Wake-and-wait: hold the request while a wake push tries to
@@ -2097,6 +2123,7 @@ wss.on('connection', (ws, req) => {
       const child = data.children.find(c => c.id === childId);
       if (!child) return sendWs(ws, { type: 'camera_error', childId, reason: 'not_found' });
       if (child.parentId !== ws.parentId) return sendWs(ws, { type: 'camera_error', childId, reason: 'forbidden' });
+      replaceOwnMonitoringSessions(ws.parentId, childId);
       const cws = liveChildren.get(childId);
       if (!cws || cws.readyState !== 1 || reapStaleChildSocket(childId)) {
         if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'camera_error', childId, reason: 'busy' });

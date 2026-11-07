@@ -1317,14 +1317,18 @@ const server = http.createServer(async (req, res) => {
     if (dMatch && req.method === 'GET') {
       const token = decodeURIComponent(dMatch[1]);
       const inv = findInvite(i => i.token === token);
-      const valid = !!inv && !inv.used && Date.now() <= inv.expiresAt;
+      // Invite links are PERMANENT (owner order 2026-11-07): the stored
+      // expiresAt is kept for display only and never enforced — an
+      // existing link keeps working at the same address forever.
+      // Single-use (!inv.used) is still enforced.
+      const valid = !!inv && !inv.used;
       if (!valid) {
         res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Family Call</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px 20px">
 <h1>Family Call</h1>
-<p>This invite link is invalid or has expired.</p>
+<p>This invite link is invalid or has already been used.</p>
 <p>Please ask the person who sent it to create a new link.</p>
 </body></html>`);
       }
@@ -1352,14 +1356,14 @@ const server = http.createServer(async (req, res) => {
     if (joinMatch && req.method === 'GET') {
       const token = decodeURIComponent(joinMatch[1]);
       const inv = findInvite(i => i.token === token);
-      const valid = !!inv && !inv.used && Date.now() <= inv.expiresAt;
+      const valid = !!inv && !inv.used; // permanent links: no expiry check
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       if (!valid) {
         return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Family Call</title></head>
 <body style="font-family:sans-serif;text-align:center;padding:40px 20px">
 <h1>Family Call</h1>
-<p>This invite link is invalid or has expired.</p>
+<p>This invite link is invalid or has already been used.</p>
 <p>Please ask the person who sent it to create a new link.</p>
 </body></html>`);
       }
@@ -1455,7 +1459,14 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const parent = authParent(req);
       if (!parent) return json(res, 401, { error: 'unauthorized' });
       const inv = data.invites[parent.id];
-      if (!inv || inv.used || Date.now() > inv.expiresAt) return json(res, 200, null);
+      if (!inv || inv.used) return json(res, 200, null);
+      // Rolling renewal (owner order 2026-11-07): links never die, and
+      // the stored expiry is pushed forward so the parent app always
+      // shows a live horizon for its permanent link.
+      if (inv.expiresAt < Date.now() + INVITE_TTL_MS) {
+        inv.expiresAt = Date.now() + INVITE_TTL_MS;
+        save();
+      }
       return json(res, 200, inviteView(req, inv));
     }
     if (p === '/api/invite' && req.method === 'DELETE') {
@@ -1473,7 +1484,7 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       let parentId = null;
       if (token) {
         const inv = findInvite(i => i.token === String(token));
-        if (!inv || inv.used || Date.now() > inv.expiresAt) {
+        if (!inv || inv.used) { // permanent links: no expiry check
           return json(res, 400, { error: 'invalid or expired invite' });
         }
         inv.used = true; // single use
@@ -1489,7 +1500,7 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
           parentId = rec.parentId;
         } else {
           const inv = findInvite(i => i.code === String(code));
-          if (!inv || inv.used || Date.now() > inv.expiresAt) {
+          if (!inv || inv.used) { // permanent links: no expiry check
             return json(res, 400, { error: 'invalid pairing code' });
           }
           inv.used = true; // single use

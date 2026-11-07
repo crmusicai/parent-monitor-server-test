@@ -56,7 +56,13 @@ const PRESENCE_GRACE_MS = parseInt(process.env.PRESENCE_GRACE_MS || '30000', 10)
 // each client is pinged; a client that misses a full cycle is
 // terminated, which runs the normal close path (sessions end,
 // presence grace starts).
-const WS_PING_MS = parseInt(process.env.WS_PING_MS || '30000', 10);
+const WS_PING_MS = parseInt(process.env.WS_PING_MS || '10000', 10);
+// A socket that has not ponged within STALE_SOCKET_MS is dead for
+// ROUTING even before the reaper terminates it (field, 2026-11-07:
+// requests poured into a half-open child socket — no wake push was
+// sent because the child "looked online" — and the parent sat at
+// "Connecting…" through the full ring/wait timeouts).
+const STALE_SOCKET_MS = parseInt(process.env.STALE_SOCKET_MS || '25000', 10);
 
 // ---------------------------------------------------------------- storage
 function blankData() {
@@ -354,9 +360,23 @@ let wakeAttempts = 0;            // diagnostics: wake pushes handed to the wake 
 // unconfigured or the target never registered a token (a held request
 // still waits — the wake is best-effort).
 const wakeService = fcm.createWakeService(fcm.defaultSender(), { windowMs: 20000 });
+function socketStale(ws) {
+  return !!ws && (Date.now() - (ws.lastPongAt || 0) > STALE_SOCKET_MS);
+}
 function childSocketOpen(childId) {
   const cws = liveChildren.get(childId);
-  return !!cws && cws.readyState === 1;
+  return !!cws && cws.readyState === 1 && !socketStale(cws);
+}
+// If the child's registered socket has been silent past STALE_SOCKET_MS,
+// reap it on the spot (terminate + unregister) and report true, so the
+// caller routes exactly like the offline case — wake push + held
+// request — instead of pouring the request into a dead socket.
+function reapStaleChildSocket(childId) {
+  const cws = liveChildren.get(childId);
+  if (!cws || !socketStale(cws)) return false;
+  liveChildren.delete(childId);
+  try { cws.terminate(); } catch {}
+  return true;
 }
 function parentSocketOpen(parentId) {
   const set = liveParents.get(parentId);
@@ -737,7 +757,7 @@ function closeSession(session, notifyWsList, reason) {
 }
 function createSession(fields) {
   const session = Object.assign({
-    id: crypto.randomBytes(16).toString('hex'),
+    id: crypto.randomBytes(16).toString('hex'), createdAt: Date.now(),
     kind: 'listen', state: 'active', media: null, initiatorRole: null, ringTimer: null,
     parentWs: null, childWs: null,
     sig: { offer: 0, answer: 0, childIce: {}, parentIce: {} }, dbg: [],
@@ -959,7 +979,7 @@ function chatView(msg) {
   return {
     id: msg.id, parentId: msg.parentId, childId: msg.childId,
     fromRole: msg.fromRole, kind: msg.kind, body: msg.body, mediaId: msg.mediaId,
-    ts: msg.ts,
+    ts: msg.ts, clientId: msg.clientId ?? null,
     replyTo: msg.replyTo ?? null,
     replySnippet: msg.replySnippet ?? null,
     read: Array.isArray(msg.readBy) && msg.readBy.includes(recipientKey),
@@ -973,7 +993,7 @@ function chatViewC(msg) {
   return {
     id: msg.id, contact: true, fromId: msg.fromId, toId: msg.toId,
     fromRole: 'child', kind: msg.kind, body: msg.body, mediaId: msg.mediaId,
-    ts: msg.ts,
+    ts: msg.ts, clientId: msg.clientId ?? null,
     replyTo: msg.replyTo ?? null,
     replySnippet: msg.replySnippet ?? null,
     read: Array.isArray(msg.readBy) && msg.readBy.includes(msg.toId),
@@ -1884,12 +1904,30 @@ const wsPingTimer = setInterval(() => {
   }
 }, WS_PING_MS);
 if (wsPingTimer.unref) wsPingTimer.unref();
+// Stale-session sweep (2026-11-07): a listen/camera session whose offer
+// was never answered (the requesting screen was abandoned — the
+// 2026-11-06 "Busy forever" zombie) must not hold the pair busy
+// indefinitely. Answered sessions are never touched, however long they
+// run; ringing calls already expire via RING_TIMEOUT_MS.
+const SESSION_UNANSWERED_TTL_MS = parseInt(process.env.SESSION_UNANSWERED_TTL_MS || '600000', 10);
+const sessionSweepTimer = setInterval(() => {
+  const now = Date.now();
+  for (const s of [...sessions.values()]) {
+    if (s.kind === 'call') continue;
+    if (s.sig && s.sig.answer > 0) continue;
+    if (now - (s.createdAt || 0) > SESSION_UNANSWERED_TTL_MS) {
+      closeSession(s, peerSockets(s), 'timeout');
+    }
+  }
+}, 30000);
+if (sessionSweepTimer.unref) sessionSweepTimer.unref();
 wss.on('connection', (ws, req) => {
   // Liveness tracking for the reaper above. The ws library (and OkHttp
   // on Android) answer protocol pings with pongs automatically; a
   // client that stops ponging is a dead connection.
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
+  ws.lastPongAt = Date.now();
+  ws.on('pong', () => { ws.isAlive = true; ws.lastPongAt = Date.now(); });
   const url = new URL(req.url, 'http://x');
   const role = url.searchParams.get('role');
 
@@ -1964,7 +2002,7 @@ wss.on('connection', (ws, req) => {
       if (!child) return sendWs(ws, { type: 'listen_error', childId, reason: 'not_found' });
       if (child.parentId !== ws.parentId) return sendWs(ws, { type: 'listen_error', childId, reason: 'forbidden' });
       const cws = liveChildren.get(childId);
-      if (!cws || cws.readyState !== 1) {
+      if (!cws || cws.readyState !== 1 || reapStaleChildSocket(childId)) {
         // Wake-and-wait: hold the request while a wake push tries to
         // bring the child back — unless the pair is busy anyway.
         if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'listen_error', childId, reason: 'busy' });
@@ -2001,7 +2039,7 @@ wss.on('connection', (ws, req) => {
       if (!child) return sendWs(ws, { type: 'camera_error', childId, reason: 'not_found' });
       if (child.parentId !== ws.parentId) return sendWs(ws, { type: 'camera_error', childId, reason: 'forbidden' });
       const cws = liveChildren.get(childId);
-      if (!cws || cws.readyState !== 1) {
+      if (!cws || cws.readyState !== 1 || reapStaleChildSocket(childId)) {
         if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'camera_error', childId, reason: 'busy' });
         const entry = attemptWake('child', child, 'camera');
         pendWakeRequest(ws, child, 'camera', { facing, logEntry: entry });
@@ -2052,7 +2090,7 @@ wss.on('connection', (ws, req) => {
         return sendWs(ws, { type: 'call_busy', childId: toId });
       }
       const pws = liveChildren.get(peer.id);
-      if (!pws || pws.readyState !== 1) {
+      if (!pws || pws.readyState !== 1 || reapStaleChildSocket(peer.id)) {
         maybeWakeChild(peer, 'call'); // fire-and-forget nudge; no hold for contacts
         return sendWs(ws, { type: 'call_error', childId: toId, reason: 'offline' });
       }
@@ -2079,7 +2117,7 @@ wss.on('connection', (ws, req) => {
         if (!child) return sendWs(ws, { type: 'call_error', childId, reason: 'not_found' });
         if (child.parentId !== ws.parentId) return sendWs(ws, { type: 'call_error', childId, reason: 'forbidden' });
         const cws = liveChildren.get(childId);
-        if (!cws || cws.readyState !== 1) {
+        if (!cws || cws.readyState !== 1 || reapStaleChildSocket(childId)) {
           if (partyBusy(ws.parentId, childId)) return sendWs(ws, { type: 'call_busy', childId });
           const entry = attemptWake('child', child, 'call');
           pendWakeRequest(ws, child, 'call', { media, logEntry: entry });
@@ -2111,6 +2149,30 @@ wss.on('connection', (ws, req) => {
         armRingTimer(s);
         for (const pws of pset) sendWs(pws, { type: 'call_invite', sessionId: s.id, media, fromId: ws.childId });
         return;
+      }
+      return;
+    }
+    if (m.type === 'call_ringing') {
+      // Ringing ACK (2026-11-07): the invited device's app confirms the
+      // invite is ON ITS SCREEN and ringing. Until this arrives the
+      // caller only knows the invite was sent — the parent app shows
+      // "Calling…" and stays silent; on this ack it shows "Ringing…"
+      // and plays ringback. Relayed once per session.
+      const s = sessions.get(m.sessionId);
+      if (!s || s.kind !== 'call' || s.state !== 'ringing' || s.ringingAcked) return;
+      if (s.contact) {
+        if (ws !== s.bWs) return;
+        s.ringingAcked = true;
+        sendWs(s.aWs, { type: 'call_ringing', sessionId: s.id, childId: s.childId });
+        return;
+      }
+      if (ws !== s.childWs) return; // only the invited child can ack
+      s.ringingAcked = true;
+      if (s.parentWs) {
+        sendWs(s.parentWs, { type: 'call_ringing', sessionId: s.id, childId: s.childId });
+      } else {
+        const set = liveParents.get(s.parentId);
+        if (set) for (const pws of set) sendWs(pws, { type: 'call_ringing', sessionId: s.id, childId: s.childId });
       }
       return;
     }
@@ -2213,6 +2275,7 @@ wss.on('connection', (ws, req) => {
           parentId: null, childId: peer.id, fromRole: 'child', kind,
           body: m.body == null ? '' : String(m.body).slice(0, 4000),
           mediaId, ts: new Date().toISOString(),
+          clientId: m.clientId ? String(m.clientId).slice(0, 64) : null,
           replyTo, replySnippet,
           deletedFor: [], readBy: [],
         };
@@ -2260,6 +2323,7 @@ wss.on('connection', (ws, req) => {
         parentId, childId, fromRole: ws.role, kind,
         body: m.body == null ? '' : String(m.body).slice(0, 4000),
         mediaId, ts: new Date().toISOString(),
+        clientId: m.clientId ? String(m.clientId).slice(0, 64) : null,
         replyTo, replySnippet,
         deletedFor: [], readBy: [],
       };
@@ -2495,7 +2559,7 @@ wss.on('connection', (ws, req) => {
       const photoId = section === 'photo' ? String(m.photoId || '') : undefined;
       if (section === 'photo' && !photoId) return sendDataError(ws, reqId, childId, section, 'bad_request');
       const cws = liveChildren.get(childId);
-      if (!cws || cws.readyState !== 1) {
+      if (!cws || cws.readyState !== 1 || reapStaleChildSocket(childId)) {
         attemptWake('child', child, 'data');
         pendDataRequest(ws, { reqId, childId, section, page, photoId });
         return;

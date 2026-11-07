@@ -1565,9 +1565,31 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const num = normalizeNumber(number);
       if (!num) return json(res, 400, { error: 'invalid phone number' });
       const entry = data.numbers[num];
-      const child = entry ? data.children.find(c => c.id === entry.childId) : null;
-      if (!entry || !child) return json(res, 404, { error: 'number not registered' });
+      if (!entry) return json(res, 404, { error: 'number not registered' });
       if (!checkPassword(password || '', entry)) return json(res, 401, { error: 'wrong password' });
+      let child = data.children.find(c => c.id === entry.childId);
+      if (!child) {
+        // Self-repair (owner order 2026-11-07): the account (number +
+        // password, just proven) outlives its device record. If the
+        // record was lost, recreate it under the SAME childId instead
+        // of dead-ending the user — login used to answer 404 here
+        // while register refused the same number as already claimed,
+        // locking the account forever.
+        child = {
+          id: entry.childId,
+          parentId: null,
+          number: num,
+          name: entry.deviceName || 'Family',
+          model: model ? String(model) : '',
+          deviceToken: newToken(),
+          fcmToken: null,
+          contacts: [],
+          createdAt: entry.createdAt || new Date().toISOString(),
+          lastSeen: null, battery: null, permissions: null, lastLocation: null, appVersion: null,
+          events: [],
+        };
+        data.children.push(child);
+      }
       // Password proven: this device becomes the account's device. The
       // deviceToken ROTATES — the previous device's credential dies
       // here (its live socket is closed; its next reconnect is refused
@@ -1955,20 +1977,19 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
         }
         const cws = liveChildren.get(child.id);
         if (cws) { try { cws.close(); } catch {} liveChildren.delete(child.id); }
-        if (child.number) {
-          // Number account (number system): "Remove" UNBINDS only —
-          // the child's own account (number, password, contacts) is
-          // the child's, not the parent's, and survives; the parent
-          // can add the same number again later. The socket close
-          // above is enough: on reconnect the child authenticates as
-          // an unbound device.
-          child.parentId = null;
-          save();
-          return json(res, 200, { ok: true, unbound: true });
-        }
-        data.children = data.children.filter(c => c.id !== child.id);
+        // "Remove" UNBINDS only — for EVERY child (owner order
+        // 2026-11-07, extending his number-account rule to all):
+        // the child's record, identity and data are the child's own
+        // and survive; only the parent link is cleared, and the
+        // parent can add the device again later. No code path may
+        // delete a child record: a hard delete here is what made
+        // pair-created devices vanish from the server entirely
+        // (KM9 0a71cd3d, Infinix 0079063e, 2026-11-07). The socket
+        // close above is enough: on reconnect the child
+        // authenticates as an unbound device.
+        child.parentId = null;
         save();
-        return json(res, 200, { ok: true });
+        return json(res, 200, { ok: true, unbound: true });
       }
       // GET /api/children/:id is not part of the API.
       return json(res, 404, { error: 'not found' });

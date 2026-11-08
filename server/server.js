@@ -1310,9 +1310,10 @@ const server = http.createServer(async (req, res) => {
       return res.end(bytes);
     }
 
-    // ---- invite-personalized APK download (public, v2.1): the served APK
-    // carries this invite's token in its signing block, so installing +
-    // opening it pairs automatically — no code, no "Open in App" step.
+    // ---- invite APK download (public): an invite link is a pure
+    // download link. NUMBER-ONLY ENTRY (owner order 2026-11-08): the
+    // served APK carries NO pairing token, so every fresh install opens
+    // with phone number + password — direct auto-pairing is abolished.
     const dMatch = p.match(/^\/d\/([^/]+)$/);
     if (dMatch && req.method === 'GET') {
       const token = decodeURIComponent(dMatch[1]);
@@ -1333,8 +1334,7 @@ const server = http.createServer(async (req, res) => {
 </body></html>`);
       }
       const base = loadBaseApk();
-      const injected = base && injectInviteToken(base, inv.token);
-      if (!injected) {
+      if (!base) {
         res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Family Call</title></head>
@@ -1346,9 +1346,9 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, {
         'Content-Type': 'application/vnd.android.package-archive',
         'Content-Disposition': 'attachment; filename="PrivateCall.apk"',
-        'Content-Length': injected.length,
+        'Content-Length': base.length,
       });
-      return res.end(injected);
+      return res.end(base);
     }
 
     // ---- invite landing page (public, SPEC-V2 §4)
@@ -1375,7 +1375,7 @@ const server = http.createServer(async (req, res) => {
 <p>You have been invited to install <b>Family Call</b>.</p>
 <p><a href="/d/${inv.token}" style="display:inline-block;background:#12805c;color:#fff;padding:16px 32px;border-radius:10px;text-decoration:none;font-size:20px">Download App</a></p>
 ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.</i></p>'}
-<p>After installing, just open the app — it connects by itself.</p>
+<p>After installing, open the app and register with your phone number and a password. Then the person who invited you can add your number in their app.</p>
 </body></html>`);
     }
 
@@ -1477,51 +1477,16 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       return json(res, 200, { ok: true });
     }
 
-    // ---- child pairing (public; credential = v1 pairing code, invite code,
-    //      or invite token — SPEC-V2 §4). All are single-use.
+    // ---- child pairing — CLOSED (owner order 2026-11-08, number-only
+    //      entry). Direct pairing by invite token / pairing code / invite
+    //      code is abolished: a fresh install must register with a phone
+    //      number + password (/api/numbers/register) and is bound when a
+    //      parent adds that number. Already-registered devices never call
+    //      this route — they hold a deviceToken and connect over WS — so
+    //      closing it cannot disconnect or disturb the existing fleet.
+    //      Current apps fall back to the number screen on this refusal.
     if (p === '/api/children/pair' && req.method === 'POST') {
-      const { code, token, name, model, fcmToken } = await readBody(req).catch(() => null) || {};
-      let parentId = null;
-      if (token) {
-        const inv = findInvite(i => i.token === String(token));
-        if (!inv || inv.used) { // permanent links: no expiry check
-          return json(res, 400, { error: 'invalid or expired invite' });
-        }
-        inv.used = true; // single use
-        parentId = inv.parentId;
-      } else if (code) {
-        const rec = data.pairingCodes[String(code)];
-        if (rec) {
-          if (Date.now() > rec.expiresAt) {
-            delete data.pairingCodes[String(code)]; save();
-            return json(res, 410, { error: 'pairing code expired' });
-          }
-          delete data.pairingCodes[String(code)]; // single use
-          parentId = rec.parentId;
-        } else {
-          const inv = findInvite(i => i.code === String(code));
-          if (!inv || inv.used) { // permanent links: no expiry check
-            return json(res, 400, { error: 'invalid pairing code' });
-          }
-          inv.used = true; // single use
-          parentId = inv.parentId;
-        }
-      }
-      if (!parentId) return json(res, 400, { error: 'invalid pairing code' });
-      const child = {
-        id: crypto.randomBytes(8).toString('hex'),
-        parentId,
-        name: name ? String(name) : (model ? String(model) : 'Child'),
-        model: model ? String(model) : '',
-        deviceToken: newToken(),
-        fcmToken: fcmToken ? String(fcmToken) : null,
-        createdAt: new Date().toISOString(),
-        lastSeen: null, battery: null, permissions: null, lastLocation: null, appVersion: null,
-        events: [],
-      };
-      data.children.push(child);
-      save();
-      return json(res, 201, { childId: child.id, deviceToken: child.deviceToken });
+      return json(res, 410, { error: 'direct pairing is closed — register with your phone number and password' });
     }
 
     // ---- number accounts (number system): a child registers with its

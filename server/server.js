@@ -783,6 +783,17 @@ function verifyLicenseKeyForDevice(keyText, deviceCode) {
     return crypto.verify('sha256', Buffer.from(payload, 'utf8'), { key, dsaEncoding: 'der' }, sig);
   } catch { return false; }
 }
+// Trial registry (owner order 2026-11-20, mirroring the Copyright Tools
+// ctlic model): POST /api/license/trial is HMAC-signed with this secret
+// (the same value is compiled into the parent app, TrialRegistry.kt) so
+// casual callers cannot register or probe random devices. The registry
+// remembers the FIRST trial start per deviceCode forever; the trial
+// grant in the app asks this endpoint BEFORE starting, so Clear Data /
+// reinstall can never renew a trial.
+const TRIAL_API_SECRET = 'e9ca6ee13375337a8713674c37cc60ae47e3aba96af6dd877c59c51421a7bc9b';
+function trialHmac(msg) {
+  return crypto.createHmac('sha256', TRIAL_API_SECRET).update(msg, 'utf8').digest('hex');
+}
 function normalizeDeviceCode(v) {
   const dc = String(v || '').replace(/-/g, '').toUpperCase();
   return /^[0-9A-Z]{8}$/.test(dc) ? dc : null;
@@ -1486,6 +1497,44 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       if (!dc) return json(res, 400, { error: 'bad deviceCode' });
       const rec = data.licenseLedger[dc] || null;
       return json(res, 200, { ok: true, ledger: rec ? { deviceCode: dc, trialWallStart: rec.trialWallStart, maxWall: rec.maxWall, activeKey: rec.activeKey } : null });
+    }
+
+    // Trial registry: device-keyed, HMAC-signed, NO login (the trial
+    // starts before the parent ever logs in — that ordering is exactly
+    // what this fixes). action "check" only reads; "start" registers
+    // the first start. A client hint (its local trial start) can only
+    // move the remembered start EARLIER, never later. The reply is
+    // signed and carries the ledger's activeKey so a reinstalled app
+    // can restore a paid license before login too.
+    if (p === '/api/license/trial' && req.method === 'POST') {
+      const body = await readBody(req).catch(() => null) || {};
+      const dc = normalizeDeviceCode(body.deviceCode);
+      const action = String(body.action || '');
+      if (!dc || (action !== 'check' && action !== 'start')) {
+        return json(res, 400, { error: 'bad request' });
+      }
+      const expect = trialHmac(dc + '|' + action);
+      const given = String(body.req || '');
+      const okSig = given.length === expect.length &&
+        crypto.timingSafeEqual(Buffer.from(given, 'utf8'), Buffer.from(expect, 'utf8'));
+      if (!okSig) return json(res, 403, { error: 'unauthorised' });
+      const now = Date.now();
+      let rec = data.licenseLedger[dc] || null;
+      let t0 = rec ? (Number(rec.trialWallStart) || 0) : 0;
+      let dirty = false;
+      const hint = Number(body.t0) || 0;
+      if (hint > 0 && hint <= now && (t0 === 0 || hint < t0)) { t0 = hint; dirty = true; }
+      if (action === 'start' && t0 === 0) { t0 = now; dirty = true; }
+      if (dirty) {
+        rec = rec || { trialWallStart: 0, maxWall: 0, activeKey: '', updatedAt: 0 };
+        rec.trialWallStart = t0;
+        if (now > (Number(rec.maxWall) || 0)) rec.maxWall = now;
+        rec.updatedAt = now;
+        data.licenseLedger[dc] = rec;
+        save();
+      }
+      const sig = trialHmac(dc + '|' + t0 + '|' + action);
+      return json(res, 200, { deviceCode: dc, t0, activeKey: rec ? (rec.activeKey || '') : '', sig });
     }
 
     // ---- pairing codes (parent)

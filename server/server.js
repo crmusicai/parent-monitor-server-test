@@ -66,7 +66,7 @@ const STALE_SOCKET_MS = parseInt(process.env.STALE_SOCKET_MS || '25000', 10);
 
 // ---------------------------------------------------------------- storage
 function blankData() {
-  return { parents: [], tokens: {}, pairingCodes: {}, children: [], invites: {}, chats: {}, media: {}, numbers: {} };
+  return { parents: [], tokens: {}, pairingCodes: {}, children: [], invites: {}, chats: {}, media: {}, numbers: {}, licenseLedger: {} };
 }
 function normalizeData(d) {
   if (!d || typeof d !== 'object') return blankData();
@@ -82,6 +82,11 @@ function normalizeData(d) {
     // { childId, salt, passwordHash, deviceName, createdAt }. Older
     // data files simply have no such key yet.
     numbers: d.numbers && typeof d.numbers === 'object' ? d.numbers : {},
+    // Online license ledger (2026-11-20): deviceCode ->
+    // { trialWallStart, maxWall, activeKey, updatedAt }. Written only by
+    // the /api/license/ledger routes; activeKey is stored only after its
+    // ECDSA signature verifies against the owner's public key.
+    licenseLedger: d.licenseLedger && typeof d.licenseLedger === 'object' ? d.licenseLedger : {},
   };
 }
 function loadData() {
@@ -102,12 +107,14 @@ function replaceData(parsed) {
   data.chats = nd.chats;
   data.media = nd.media;
   data.numbers = nd.numbers;
+  data.licenseLedger = nd.licenseLedger;
 }
 function isDataEmpty(d) {
   return d.parents.length === 0 && d.children.length === 0
     && Object.keys(d.tokens).length === 0 && Object.keys(d.pairingCodes).length === 0
     && Object.keys(d.invites).length === 0 && Object.keys(d.chats).length === 0
-    && Object.keys(d.media).length === 0 && Object.keys(d.numbers).length === 0;
+    && Object.keys(d.media).length === 0 && Object.keys(d.numbers).length === 0
+    && Object.keys(d.licenseLedger || {}).length === 0;
 }
 function saveLocalOnly() {
   const tmp = DATA_FILE + '.tmp';
@@ -756,6 +763,29 @@ function authChild(req) {
   const token = h.startsWith('Bearer ') ? h.slice(7) : '';
   if (!token) return null;
   return data.children.find(c => c.deviceToken === token) || null;
+}
+// ---- online license ledger (2026-11-20) --------------------------------
+// Owner's ECDSA P-256 public key (SPKI base64) — the same key the parent
+// app verifies license keys against (License.kt PUBLIC_KEY_B64). The
+// server stores a ledger activeKey ONLY when the key is a genuine
+// owner-issued PC1 key bound to the claimed deviceCode, so a ledger entry
+// can never mint or transplant a license.
+const LICENSE_PUBKEY_SPKI_B64 = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEyJrcalxY4u1oz353Z+APluk0rabnomX9NL82WuhKHtY1ZR4nBro7CNi0TBOs2RrmhPj+dDiGPOxkn1Y6YCrHcg==';
+function verifyLicenseKeyForDevice(keyText, deviceCode) {
+  try {
+    const parts = String(keyText || '').trim().split('.');
+    if (parts.length !== 3 || parts[0] !== 'PC1') return false;
+    const payload = Buffer.from(parts[1], 'base64url').toString('utf8');
+    const fields = payload.split('|');
+    if (fields.length !== 3 || fields[0] !== deviceCode) return false;
+    const key = crypto.createPublicKey({ key: Buffer.from(LICENSE_PUBKEY_SPKI_B64, 'base64'), format: 'der', type: 'spki' });
+    const sig = Buffer.from(parts[2], 'base64url');
+    return crypto.verify('sha256', Buffer.from(payload, 'utf8'), { key, dsaEncoding: 'der' }, sig);
+  } catch { return false; }
+}
+function normalizeDeviceCode(v) {
+  const dc = String(v || '').replace(/-/g, '').toUpperCase();
+  return /^[0-9A-Z]{8}$/.test(dc) ? dc : null;
 }
 function childOnline(c) {
   // Live socket OR still inside the reconnect grace window.
@@ -1418,6 +1448,44 @@ ${apkReady ? '' : '<p><i>Note: the app file is not available on the server yet.<
       const parent = authParent(req);
       if (!parent) return json(res, 401, { error: 'unauthorized' });
       return json(res, 200, { parentId: parent.id, name: parent.name, phone: parent.phone });
+    }
+
+    // ---- online license ledger (parent auth; 2026-11-20)
+    // The parent app mirrors its license/trial state here so Clear Data
+    // or a reinstall can neither lose a paid license nor renew an expired
+    // trial. Merge rules: earliest trial start wins, highest maxWall
+    // wins, and an activeKey is stored only if its ECDSA signature
+    // verifies for this exact deviceCode (see verifyLicenseKeyForDevice).
+    if (p === '/api/license/ledger' && req.method === 'POST') {
+      const parent = authParent(req);
+      if (!parent) return json(res, 401, { error: 'unauthorized' });
+      const body = await readBody(req).catch(() => null) || {};
+      const dc = normalizeDeviceCode(body.deviceCode);
+      if (!dc) return json(res, 400, { error: 'bad deviceCode' });
+      const rec = data.licenseLedger[dc] || { trialWallStart: 0, maxWall: 0, activeKey: '', updatedAt: 0 };
+      const tw = Number(body.trialWallStart) || 0;
+      if (tw > 0 && (rec.trialWallStart === 0 || tw < rec.trialWallStart)) rec.trialWallStart = tw;
+      const mw = Number(body.maxWall) || 0;
+      if (mw > rec.maxWall) rec.maxWall = mw;
+      if (body.activeKey) {
+        const k = String(body.activeKey).trim();
+        if (k.length > 2048 || !verifyLicenseKeyForDevice(k, dc)) {
+          return json(res, 400, { error: 'invalid license key' });
+        }
+        rec.activeKey = k;
+      }
+      rec.updatedAt = Date.now();
+      data.licenseLedger[dc] = rec;
+      save();
+      return json(res, 200, { ok: true, ledger: { deviceCode: dc, trialWallStart: rec.trialWallStart, maxWall: rec.maxWall, activeKey: rec.activeKey } });
+    }
+    if (p === '/api/license/ledger' && req.method === 'GET') {
+      const parent = authParent(req);
+      if (!parent) return json(res, 401, { error: 'unauthorized' });
+      const dc = normalizeDeviceCode(url.searchParams.get('deviceCode'));
+      if (!dc) return json(res, 400, { error: 'bad deviceCode' });
+      const rec = data.licenseLedger[dc] || null;
+      return json(res, 200, { ok: true, ledger: rec ? { deviceCode: dc, trialWallStart: rec.trialWallStart, maxWall: rec.maxWall, activeKey: rec.activeKey } : null });
     }
 
     // ---- pairing codes (parent)
